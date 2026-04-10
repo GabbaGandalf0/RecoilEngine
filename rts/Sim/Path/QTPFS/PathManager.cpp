@@ -27,6 +27,7 @@
 #include "Sim/Misc/TeamHandler.h"
 #include "Sim/MoveTypes/MoveDefHandler.h"
 #include "Sim/MoveTypes/MoveMath/MoveMath.h"
+#include "Sim/Units/UnitHandler.h"
 #include "Sim/Objects/SolidObject.h"
 #include "System/Config/ConfigHandler.h"
 #include "System/FileSystem/ArchiveScanner.h"
@@ -153,6 +154,9 @@ namespace QTPFS {
 
 		return registry.try_get<UnsyncedPathSearch>(entityId);
 	};
+
+	static bool pendingLoadSaveRestore = false;
+	static LoadSaveState pendingLoadSaveState;
 }
 
 QTPFS::PathManager::PathManager() {
@@ -1838,4 +1842,278 @@ int2 QTPFS::PathManager::GetNumQueuedUpdates() const {
 	data.y = updateDirtyPathRemainder;
 
 	return data;
+}
+
+void QTPFS::PathManager::CaptureLoadSaveState(LoadSaveState& outState) const
+{
+	RECOIL_DETAILED_TRACY_ZONE;
+	outState = LoadSaveState{};
+
+	if (!IsFinalized())
+		return;
+
+	auto capturePathRecord = [&outState, this](QTPFS::entity entity, const IPath& path, int kind) {
+		if (registry.any_of<PathSearchRef, PathIsTemp>(entity)) {
+			outState.skippedPendingPaths += 1;
+			return;
+		}
+
+		LoadSavePathRecord record;
+		record.entityId = entt::to_integral(entity);
+		record.kind = kind;
+		record.ownerId = (path.GetOwner() != nullptr) ? path.GetOwner()->id : -1;
+		record.pathType = path.GetPathType();
+		record.nextPointIndex = path.GetNextPointIndex();
+		record.repathAtPointIndex = path.GetRepathTriggerIndex();
+		record.numPathUpdates = path.GetNumPathUpdates();
+		record.firstNodeIdOfCleanPath = path.GetFirstNodeIdOfCleanPath();
+		record.hashLow = path.GetHash().GetLow();
+		record.hashHigh = path.GetHash().GetHigh();
+		record.virtualHashLow = path.GetVirtualHash().GetLow();
+		record.virtualHashHigh = path.GetVirtualHash().GetHigh();
+		record.radius = path.GetRadius();
+		record.synced = path.IsSynced();
+		record.haveFullPath = path.IsFullPath();
+		record.havePartialPath = path.IsPartialPath();
+		record.boundingBoxOverride = path.IsBoundingBoxOverriden();
+		record.isRawPath = path.IsRawPath();
+		record.hasRequeueComponent = registry.all_of<PathRequeueSearch>(entity);
+		record.requeueSearch = record.hasRequeueComponent ? registry.get<PathRequeueSearch>(entity).value : false;
+		record.boundingBoxMins = path.GetBoundingBoxMins();
+		record.boundingBoxMaxs = path.GetBoundingBoxMaxs();
+		record.goalPosition = path.GetGoalPosition();
+
+		record.points.reserve(path.NumPoints());
+		for (unsigned int pointIdx = 0; pointIdx < path.NumPoints(); ++pointIdx) {
+			record.points.emplace_back(path.GetPoint(pointIdx));
+		}
+
+		const auto& pathNodes = path.GetNodeList();
+		record.nodes.reserve(pathNodes.size());
+		for (const auto& node : pathNodes) {
+			LoadSavePathNode savedNode;
+			savedNode.nodeId = node.nodeId;
+			savedNode.nodeNumber = node.nodeNumber;
+			savedNode.netPointX = node.netPoint.x;
+			savedNode.netPointY = node.netPoint.y;
+			savedNode.pathPointIndex = node.pathPointIndex;
+			savedNode.xmin = node.xmin;
+			savedNode.zmin = node.zmin;
+			savedNode.xmax = node.xmax;
+			savedNode.zmax = node.zmax;
+			savedNode.badNode = node.badNode;
+			record.nodes.emplace_back(savedNode);
+		}
+
+		outState.paths.emplace_back(std::move(record));
+	};
+
+	registry.view<IPath>().each([&capturePathRecord](QTPFS::entity entity, const IPath& path) {
+		capturePathRecord(entity, path, LoadSavePathRecord::KIND_SYNCED);
+	});
+
+	registry.view<ExternallyManagedSyncedIPath>().each([&capturePathRecord](QTPFS::entity entity, const ExternallyManagedSyncedIPath& path) {
+		capturePathRecord(entity, path, LoadSavePathRecord::KIND_EXTERNAL_SYNCED);
+	});
+
+	outState.skippedUnsyncedPaths = static_cast<unsigned int>(registry.storage<UnsyncedIPath>().size());
+}
+
+void QTPFS::PathManager::QueueLoadSaveRestore(const LoadSaveState& state)
+{
+	RECOIL_DETAILED_TRACY_ZONE;
+	pendingLoadSaveState = state;
+	pendingLoadSaveRestore = true;
+}
+
+bool QTPFS::PathManager::HasLivePath(unsigned int pathID, bool requireSynced) const
+{
+	RECOIL_DETAILED_TRACY_ZONE;
+	const QTPFS::entity pathEntity = static_cast<QTPFS::entity>(pathID);
+	const IPath* livePath = GetPath(pathEntity);
+
+	if (livePath == nullptr)
+		return false;
+	if (requireSynced && !livePath->IsSynced())
+		return false;
+	if (registry.any_of<PathIsTemp>(pathEntity))
+		return false;
+
+	return true;
+}
+
+void QTPFS::PathManager::ApplyLoadSaveRestore()
+{
+	RECOIL_DETAILED_TRACY_ZONE;
+	if (!pendingLoadSaveRestore)
+		return;
+	if (!IsFinalized()) {
+		LOG_L(L_WARNING, "[QTPFS::%s] path manager is not finalized yet, keeping queued restore", __func__);
+		return;
+	}
+
+	auto clearPathTraces = [this]() {
+		for (auto& [pathID, trace] : pathTraces) {
+			delete trace;
+		}
+		pathTraces.clear();
+	};
+
+	clearPathTraces();
+	sharedPaths.clear();
+	partialSharedPaths.clear();
+
+	std::vector<QTPFS::entity> entitiesToDestroy;
+	registry.each([&entitiesToDestroy](QTPFS::entity entity) {
+		if (registry.any_of<
+			IPath,
+			ExternallyManagedSyncedIPath,
+			UnsyncedIPath,
+			PathSearch,
+			ExternallyManagedPathSearch,
+			UnsyncedPathSearch,
+			SharedPathChain,
+			PartialSharedPathChain,
+			PathIsTemp,
+			PathIsDirty,
+			PathIsToBeUpdated,
+			PathUpdatedCounterIncrease,
+			ProcessPath,
+			PathSearchRef,
+			PathRequeueSearch,
+			PathDelayedDelete
+		>(entity)) {
+			entitiesToDestroy.emplace_back(entity);
+		}
+	});
+
+	for (const QTPFS::entity entity : entitiesToDestroy) {
+		if (registry.valid(entity))
+			registry.destroy(entity);
+	}
+
+	updateDirtyPathRate = 0;
+	updateDirtyPathRemainder = 0;
+
+	std::vector<QTPFS::entity> restoredPaths;
+	restoredPaths.reserve(pendingLoadSaveState.paths.size());
+
+	for (const LoadSavePathRecord& record : pendingLoadSaveState.paths) {
+		if (record.entityId <= 0 || record.points.size() < 2) {
+			LOG_L(L_WARNING, "[QTPFS::%s] skipping invalid saved path entity=%d points=%u",
+				__func__, record.entityId, static_cast<unsigned int>(record.points.size()));
+			continue;
+		}
+
+		const QTPFS::entity wantedEntity = static_cast<QTPFS::entity>(record.entityId);
+		const QTPFS::entity createdEntity = registry.create(wantedEntity);
+
+		if (createdEntity != wantedEntity) {
+			LOG_L(L_WARNING, "[QTPFS::%s] failed to restore path entity %d, got %d instead",
+				__func__, record.entityId, entt::to_integral(createdEntity));
+			if (registry.valid(createdEntity))
+				registry.destroy(createdEntity);
+			continue;
+		}
+
+		IPath* path = nullptr;
+		switch (record.kind) {
+			case LoadSavePathRecord::KIND_EXTERNAL_SYNCED:
+				path = &registry.emplace<ExternallyManagedSyncedIPath>(createdEntity);
+				break;
+			case LoadSavePathRecord::KIND_SYNCED:
+			default:
+				path = &registry.emplace<IPath>(createdEntity);
+				break;
+		}
+
+		path->SetID(record.entityId);
+		path->SetPathType(record.pathType);
+		path->SetRadius(record.radius);
+		path->SetSynced(record.synced);
+		path->SetHasFullPath(record.haveFullPath);
+		path->SetHasPartialPath(record.havePartialPath);
+		path->SetNextPointIndex(record.nextPointIndex);
+		path->SetRepathTriggerIndex(record.repathAtPointIndex);
+		path->SetNumPathUpdates(record.numPathUpdates);
+		path->SetFirstNodeIdOfCleanPath(record.firstNodeIdOfCleanPath);
+		path->SetHash(PathHashType(record.hashLow, record.hashHigh));
+		path->SetVirtualHash(PathHashType(record.virtualHashLow, record.virtualHashHigh));
+		path->SetGoalPosition(record.goalPosition);
+		path->SetIsRawPath(record.isRawPath);
+		path->SetOwner((record.ownerId >= 0) ? unitHandler.GetUnit(record.ownerId) : nullptr);
+
+		path->AllocPoints(record.points.size());
+		for (unsigned int pointIdx = 0; pointIdx < record.points.size(); ++pointIdx) {
+			path->SetPoint(pointIdx, record.points[pointIdx]);
+		}
+
+		path->AllocNodes(record.nodes.size());
+		for (unsigned int nodeIdx = 0; nodeIdx < record.nodes.size(); ++nodeIdx) {
+			const auto& savedNode = record.nodes[nodeIdx];
+			path->SetNode(nodeIdx, savedNode.nodeId, savedNode.nodeNumber, float2(savedNode.netPointX, savedNode.netPointY), savedNode.pathPointIndex, savedNode.badNode);
+			path->SetNodeBoundary(nodeIdx, savedNode.xmin, savedNode.zmin, savedNode.xmax, savedNode.zmax);
+		}
+
+		if (record.boundingBoxOverride) {
+			path->SetBoundingBox(record.boundingBoxMins, record.boundingBoxMaxs);
+		} else {
+			path->SetBoundingBox();
+		}
+
+		if (record.kind == LoadSavePathRecord::KIND_SYNCED) {
+			registry.emplace<PathRequeueSearch>(createdEntity, record.hasRequeueComponent ? record.requeueSearch : false);
+		}
+
+		restoredPaths.emplace_back(createdEntity);
+	}
+
+	spring::unordered_map<PathHashType, std::vector<QTPFS::entity>> sharedPathGroups;
+	spring::unordered_map<PathHashType, std::vector<QTPFS::entity>> partialSharedPathGroups;
+
+	for (const QTPFS::entity entity : restoredPaths) {
+		IPath* path = registry.try_get<IPath>(entity);
+		if (path == nullptr)
+			continue;
+		if (path->GetOwner() == nullptr)
+			continue;
+
+		if (path->GetHash() != BAD_HASH) {
+			sharedPathGroups[path->GetHash()].emplace_back(entity);
+		}
+		if (path->GetVirtualHash() != BAD_HASH) {
+			partialSharedPathGroups[path->GetVirtualHash()].emplace_back(entity);
+		}
+	}
+
+	for (auto& [hash, entities] : sharedPathGroups) {
+		if (entities.empty())
+			continue;
+
+		for (size_t idx = 0; idx < entities.size(); ++idx) {
+			const QTPFS::entity entity = entities[idx];
+			const QTPFS::entity prev = entities[(idx + entities.size() - 1) % entities.size()];
+			const QTPFS::entity next = entities[(idx + 1) % entities.size()];
+			registry.emplace<SharedPathChain>(entity, prev, next);
+		}
+
+		sharedPaths[hash] = entities.front();
+	}
+
+	for (auto& [hash, entities] : partialSharedPathGroups) {
+		if (entities.empty())
+			continue;
+
+		for (size_t idx = 0; idx < entities.size(); ++idx) {
+			const QTPFS::entity entity = entities[idx];
+			const QTPFS::entity prev = entities[(idx + entities.size() - 1) % entities.size()];
+			const QTPFS::entity next = entities[(idx + 1) % entities.size()];
+			registry.emplace<PartialSharedPathChain>(entity, prev, next);
+		}
+
+		partialSharedPaths[hash] = entities.front();
+	}
+
+	pendingLoadSaveState = LoadSaveState{};
+	pendingLoadSaveRestore = false;
 }

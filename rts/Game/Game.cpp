@@ -88,6 +88,7 @@
 #include "Sim/MoveTypes/MoveDefHandler.h"
 #include "Sim/MoveTypes/MoveTypeFactory.h"
 #include "Sim/Path/IPathManager.h"
+#include "Sim/Path/QTPFS/PathManager.h"
 #include "Sim/Projectiles/ExplosionGenerator.h"
 #include "Sim/Projectiles/Projectile.h"
 #include "Sim/Projectiles/ProjectileHandler.h"
@@ -123,6 +124,7 @@
 #include "System/LoadSave/LoadSaveHandler.h"
 #include "System/LoadSave/DemoRecorder.h"
 #include "System/Log/ILog.h"
+#include "System/Net/LocalConnection.h"
 #include "System/Platform/Misc.h"
 #include "System/Platform/Watchdog.h"
 #include "System/Platform/errorhandler.h"
@@ -133,6 +135,10 @@
 #include "System/LoadLock.h"
 
 #include "System/Misc/TracyDefs.h"
+
+namespace netcode {
+	void ResetLocalSyncChecksumCache();
+}
 
 #include "fmt/ranges.h"
 
@@ -936,11 +942,30 @@ void CGame::PostLoad()
 	RECOIL_DETAILED_TRACY_ZONE;
 	GameSetupDrawer::Disable();
 
+	// Reapply the local player's derived unsynced view after the synced
+	// CPlayer state was restored from the savegame.
+	if (playerHandler.IsValidPlayer(gu->myPlayerNum)) {
+		CPlayer::UpdateControlledTeams();
+		gu->SetMyPlayer(gu->myPlayerNum);
+	}
+
+	if (auto* qtpfsPathManager = dynamic_cast<QTPFS::PathManager*>(pathManager); qtpfsPathManager != nullptr) {
+		// Rebuild QTPFS node-layers against the map state that was just restored from the savegame.
+		// Without this, replay checkpoints can restore path objects onto a pathfinding graph that still
+		// reflects the pre-load map state, which is enough to trip sync checks almost immediately.
+		qtpfsPathManager->TerrainChange(0, 0, mapDims.mapx, mapDims.mapy, 0);
+		qtpfsPathManager->PostFinalizeRefresh();
+		qtpfsPathManager->ApplyLoadSaveRestore();
+	}
+
 	Sim::systemUtils.NotifyPostLoad();
 
 	if (gameServer != nullptr) {
 		gameServer->PostLoad(gs->frameNum);
 	}
+
+	netcode::CLocalConnection::ApplyPendingRestore();
+	netcode::ResetLocalSyncChecksumCache();
 }
 
 
@@ -2204,4 +2229,3 @@ const ActionList& CGame::GetLastActionList()
 {
 	return gameInputReceiver.lastActionList;
 }
-

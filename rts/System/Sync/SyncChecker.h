@@ -33,6 +33,7 @@ class CSyncChecker {
 		 * Keeps a running checksum over all assignments to synced variables.
 		 */
 		static unsigned GetChecksum() { return g_checksum; }
+		static void SetChecksum(unsigned checksum) { g_checksum = checksum; }
 		static void NewFrame();
 		static void debugSyncCheckThreading();
 		static void Sync(uint32_t val);

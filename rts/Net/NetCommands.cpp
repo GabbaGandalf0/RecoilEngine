@@ -48,6 +48,13 @@ LOG_REGISTER_SECTION_GLOBAL(LOG_SECTION_NET)
 
 static spring::unordered_map<int32_t, uint32_t> localSyncChecksums;
 
+namespace netcode {
+	void ResetLocalSyncChecksumCache()
+	{
+		localSyncChecksums.clear();
+	}
+}
+
 
 void CGame::AddTraffic(int playerID, int packetCode, int length)
 {

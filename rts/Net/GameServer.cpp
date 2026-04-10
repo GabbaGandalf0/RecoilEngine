@@ -49,6 +49,7 @@
 #include "System/FileSystem/SimpleParser.h"
 #include "System/Net/Connection.h"
 #include "System/Net/LocalConnection.h"
+#include "System/Net/LoopbackConnection.h"
 #include "System/Net/UnpackPacket.h"
 #include "System/LoadSave/DemoRecorder.h"
 #include "System/LoadSave/DemoReader.h"
@@ -286,10 +287,35 @@ void CGameServer::PostLoad(int newServerFrameNum)
 	serverFrameNum = newServerFrameNum;
 
 	gameHasStarted = !PreSimFrame();
+	packetCache.clear();
+
+#ifdef SYNCCHECK
+	outstandingSyncFrames.clear();
+	syncErrorFrame = 0;
+	syncWarningFrame = 0;
+	desyncHasOccurred = false;
+#endif
 
 	// for all GameParticipant's
 	for (GameParticipant& p: players) {
 		p.lastFrameResponse = newServerFrameNum;
+		p.desynced = false;
+
+#ifdef SYNCCHECK
+		p.syncResponse.clear();
+#endif
+
+		for (auto& aiLinkEntry: p.aiClientLinks) {
+			GameParticipant::ClientLinkData& linkData = aiLinkEntry.second;
+			linkData.bandwidthUsage = 0;
+			linkData.numPacketsSent = 0;
+
+			if (linkData.link == nullptr)
+				continue;
+
+			if (auto* loopback = dynamic_cast<netcode::CLoopbackConnection*>(linkData.link.get()))
+				loopback->ClearQueue();
+		}
 	}
 }
 
@@ -3102,4 +3128,3 @@ uint8_t CGameServer::ReserveSkirmishAIId()
 	freeSkirmishAIs.pop_back();
 	return id;
 }
-

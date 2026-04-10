@@ -23,6 +23,7 @@
 #include "Sim/Misc/QuadField.h"
 #include "Sim/Misc/TeamHandler.h"
 #include "Sim/Path/IPathManager.h"
+#include "Sim/Path/QTPFS/PathManager.h"
 #include "Sim/Units/Scripts/CobInstance.h"
 #include "Sim/Units/CommandAI/CommandAI.h"
 #include "Sim/Units/CommandAI/MobileCAI.h"
@@ -564,6 +565,19 @@ void CGroundMoveType::PostLoad()
 	}
 
 	Connect();
+
+	if (auto* qtpfsPathManager = dynamic_cast<QTPFS::PathManager*>(pathManager); qtpfsPathManager != nullptr) {
+		const bool haveCurrentPath = (pathID != 0) && qtpfsPathManager->HasLivePath(pathID, true);
+
+		if ((nextPathId != 0) && !qtpfsPathManager->HasLivePath(nextPathId))
+			nextPathId = 0;
+		if ((deletePathId != 0) && !qtpfsPathManager->HasLivePath(deletePathId))
+			deletePathId = 0;
+
+		if (haveCurrentPath) {
+			return;
+		}
+	}
 
 	// HACK: re-initialize path after load
 	if (pathID == 0)
@@ -3728,4 +3742,3 @@ bool CGroundMoveType::SetMemberValue(unsigned int memberHash, void* memberValue)
 
 	return false;
 }
-

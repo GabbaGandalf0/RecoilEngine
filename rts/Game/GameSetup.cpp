@@ -566,13 +566,10 @@ bool CGameSetup::Init(const std::string& buf)
 	if (!file.SectionExist("GAME"))
 		return false;
 
-	#ifdef DEDICATED
 	{
-		// read script-provided hashes for dedicated server
+		// read script-provided replay hashes for save-load and demo-based reloads
 		const std::string mapHashHexStr = file.SGetValueDef("",  "GAME\\MapHash");
 		const std::string modHashHexStr = file.SGetValueDef("",  "GAME\\ModHash");
-
-		LOG_L(L_INFO, "[GameSetup::%s]\n\tmapHashHexStr=\"%s\"\n\tmodHashHexStr=\"%s\"", __func__, mapHashHexStr.c_str(), modHashHexStr.c_str());
 
 		sha512::hex_digest mapHashHex;
 		sha512::hex_digest modHashHex;
@@ -591,13 +588,13 @@ bool CGameSetup::Init(const std::string& buf)
 
 		if (mapHashHexStr.size() == (sha512::SHA_LEN * 2)) {
 			std::copy(mapHashHexStr.begin(), mapHashHexStr.end(), mapHashHex.data());
-		} else {
+		} else if (!mapHashHexStr.empty() && mapHashHexStr.size() != 1) {
 			LOG_L(L_WARNING, "[GameSetup::%s] DS map-hash string \"%s\" should contain %u characters", __func__, mapHashHexStr.c_str(), sha512::SHA_LEN * 2);
 		}
 
 		if (modHashHexStr.size() == (sha512::SHA_LEN * 2)) {
 			std::copy(modHashHexStr.begin(), modHashHexStr.end(), modHashHex.data());
-		} else {
+		} else if (!modHashHexStr.empty() && modHashHexStr.size() != 1) {
 			LOG_L(L_WARNING, "[GameSetup::%s] DS mod-hash string \"%s\" should contain %u characters", __func__, modHashHexStr.c_str(), sha512::SHA_LEN * 2);
 		}
 
@@ -606,7 +603,6 @@ bool CGameSetup::Init(const std::string& buf)
 		std::memcpy(dsMapHash, mapHashRaw.data(), sizeof(dsMapHash));
 		std::memcpy(dsModHash, modHashRaw.data(), sizeof(dsModHash));
 	}
-	#endif
 
 	/* Don't be afraid to reuse MapSeed for something sensible if you're
 	 * implementing a proper random map generator. It's just used here
@@ -678,4 +674,3 @@ std::string CGameSetup::MapFileName() const
 {
 	return (archiveScanner->MapNameToMapFile(mapName));
 }
-

@@ -7,6 +7,7 @@
 
 #include "Sim/Misc/ModInfo.h"
 #include "Sim/Path/IPathManager.h"
+#include "System/creg/creg_cond.h"
 #include "NodeLayer.h"
 #include "PathCache.h"
 #include "PathSearch.h"
@@ -18,6 +19,69 @@ class CSolidObject;
 
 
 namespace QTPFS {
+	struct LoadSavePathNode {
+		CR_DECLARE_STRUCT(LoadSavePathNode)
+
+		std::uint32_t nodeId = -1U;
+		std::uint32_t nodeNumber = -1U;
+		float netPointX = 0.0f;
+		float netPointY = 0.0f;
+		int pathPointIndex = -1;
+		int xmin = 0;
+		int zmin = 0;
+		int xmax = 0;
+		int zmax = 0;
+		bool badNode = false;
+	};
+
+	struct LoadSavePathRecord {
+		CR_DECLARE_STRUCT(LoadSavePathRecord)
+
+		enum Kind {
+			KIND_SYNCED = 0,
+			KIND_EXTERNAL_SYNCED = 1,
+		};
+
+		int entityId = 0;
+		int kind = KIND_SYNCED;
+		int ownerId = -1;
+		int pathType = 0;
+
+		unsigned int nextPointIndex = 0;
+		unsigned int repathAtPointIndex = 0;
+		unsigned int numPathUpdates = 0;
+		unsigned int firstNodeIdOfCleanPath = 0;
+
+		std::uint64_t hashLow = BAD_HASH_PART;
+		std::uint64_t hashHigh = BAD_HASH_PART;
+		std::uint64_t virtualHashLow = BAD_HASH_PART;
+		std::uint64_t virtualHashHigh = BAD_HASH_PART;
+		float radius = 0.0f;
+
+		bool synced = true;
+		bool haveFullPath = true;
+		bool havePartialPath = false;
+		bool boundingBoxOverride = false;
+		bool isRawPath = false;
+		bool hasRequeueComponent = false;
+		bool requeueSearch = false;
+
+		std::vector<float3> points;
+		std::vector<LoadSavePathNode> nodes;
+
+		float3 boundingBoxMins;
+		float3 boundingBoxMaxs;
+		float3 goalPosition;
+	};
+
+	struct LoadSaveState {
+		CR_DECLARE_STRUCT(LoadSaveState)
+
+		std::vector<LoadSavePathRecord> paths;
+		unsigned int skippedPendingPaths = 0;
+		unsigned int skippedUnsyncedPaths = 0;
+	};
+
 	struct QTNode;
 	class PathManager: public IPathManager {
 	public:
@@ -92,6 +156,10 @@ namespace QTPFS {
 		const NodeLayersChangeTrack& GetMapDamageTrack() const { return nodeLayersMapDamageTrack; };
 
 		const spring::unordered_map<unsigned int, PathSearchTrace::Execution*>& GetPathTraces() const { return pathTraces; }
+		void CaptureLoadSaveState(LoadSaveState& outState) const;
+		void QueueLoadSaveRestore(const LoadSaveState& state);
+		void ApplyLoadSaveRestore();
+		bool HasLivePath(unsigned int pathID, bool requireSynced = false) const;
 
 	private:
 		void MapChanged(int x1, int z1, int x2, int z2);
@@ -207,4 +275,3 @@ namespace QTPFS {
 }
 
 #endif
-

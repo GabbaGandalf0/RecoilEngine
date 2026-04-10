@@ -11,6 +11,8 @@
 #include "Game/GameSetup.h"
 #include "Game/GameVersion.h"
 #include "Game/GlobalUnsynced.h"
+#include "Game/Players/PlayerHandler.h"
+#include "Game/SelectedUnitsHandler.h"
 #include "Game/WaitCommandsAI.h"
 #include "Game/SelectedUnitsHandler.h"
 #include "Game/UI/Groups/GroupHandler.h"
@@ -25,12 +27,15 @@
 #include "Sim/Units/UnitHandler.h"
 #include "Sim/Misc/BuildingMaskMap.h"
 #include "Sim/Misc/GroundBlockingObjectMap.h"
+#include "Sim/Misc/GlobalSynced.h"
 #include "Sim/Misc/InterceptHandler.h"
 #include "Sim/Misc/LosHandler.h"
 #include "Sim/Misc/QuadField.h"
 #include "Sim/Misc/CategoryHandler.h"
 #include "Sim/MoveTypes/MoveDefHandler.h"
 #include "Sim/Misc/TeamHandler.h"
+#include "Sim/Path/IPathManager.h"
+#include "Sim/Path/QTPFS/PathManager.h"
 #include "Sim/Misc/Wind.h"
 #include "Sim/Misc/YardmapStatusEffectsMap.h"
 #include "Sim/Projectiles/ProjectileHandler.h"
@@ -49,6 +54,8 @@
 #include "System/creg/Serializer.h"
 #include "System/Exceptions.h"
 #include "System/Log/ILog.h"
+#include "System/Net/LocalConnection.h"
+#include "System/Sync/SyncChecker.h"
 
 #define MAX_STRING_SIZE (1 << 19) // 512kB excluding null-term
 
@@ -59,6 +66,243 @@ CCregLoadSaveHandler::CCregLoadSaveHandler()
 CCregLoadSaveHandler::~CCregLoadSaveHandler() = default;
 
 #ifdef USING_CREG
+class CLocalConnectionStateCollector
+{
+	CR_DECLARE_STRUCT(CLocalConnectionStateCollector)
+
+public:
+	CLocalConnectionStateCollector() = default;
+
+	void Serialize(creg::ISerializer* s);
+	void PostLoad();
+
+	unsigned int numInstances = 0;
+	std::vector<std::vector<uint8_t>> queue0;
+	std::vector<std::vector<uint8_t>> queue1;
+};
+
+CR_BIND(CLocalConnectionStateCollector, )
+CR_REG_METADATA(CLocalConnectionStateCollector, (
+	CR_MEMBER(numInstances),
+	CR_MEMBER(queue0),
+	CR_MEMBER(queue1),
+	CR_SERIALIZER(Serialize),
+	CR_POSTLOAD(PostLoad)
+))
+
+void CLocalConnectionStateCollector::Serialize(creg::ISerializer* s)
+{
+	if (s->IsWriting()) {
+		netcode::CLocalConnection::CaptureState(numInstances, queue0, queue1);
+	}
+}
+
+void CLocalConnectionStateCollector::PostLoad()
+{
+	netcode::CLocalConnection::QueueRestoreState(numInstances, queue0, queue1);
+}
+
+#ifdef SYNCCHECK
+class CSyncCheckerStateCollector
+{
+	CR_DECLARE_STRUCT(CSyncCheckerStateCollector)
+
+public:
+	CSyncCheckerStateCollector() = default;
+
+	void Serialize(creg::ISerializer* s);
+	void PostLoad();
+
+	unsigned int checksum = 0xfade1eaf;
+};
+
+CR_BIND(CSyncCheckerStateCollector, )
+CR_REG_METADATA(CSyncCheckerStateCollector, (
+	CR_MEMBER(checksum),
+	CR_SERIALIZER(Serialize),
+	CR_POSTLOAD(PostLoad)
+))
+
+void CSyncCheckerStateCollector::Serialize(creg::ISerializer* s)
+{
+	if (s->IsWriting())
+		checksum = CSyncChecker::GetChecksum();
+}
+
+void CSyncCheckerStateCollector::PostLoad()
+{
+	CSyncChecker::SetChecksum(checksum);
+}
+#endif
+
+class CSelectedUnitsStateCollector
+{
+	CR_DECLARE_STRUCT(CSelectedUnitsStateCollector)
+
+public:
+	CSelectedUnitsStateCollector() = default;
+
+	void Serialize(creg::ISerializer* s);
+	void PostLoad();
+
+	std::vector<std::vector<int>> netSelected;
+};
+
+CR_BIND(CSelectedUnitsStateCollector, )
+CR_REG_METADATA(CSelectedUnitsStateCollector, (
+	CR_MEMBER(netSelected),
+	CR_SERIALIZER(Serialize),
+	CR_POSTLOAD(PostLoad)
+))
+
+void CSelectedUnitsStateCollector::Serialize(creg::ISerializer* s)
+{
+	if (s->IsWriting())
+		netSelected = selectedUnitsHandler.netSelected;
+}
+
+void CSelectedUnitsStateCollector::PostLoad()
+{
+	selectedUnitsHandler.netSelected = netSelected;
+
+	if (selectedUnitsHandler.netSelected.size() < playerHandler.ActivePlayers())
+		selectedUnitsHandler.netSelected.resize(playerHandler.ActivePlayers());
+}
+
+class CGlobalSyncedRNGStateCollector
+{
+	CR_DECLARE_STRUCT(CGlobalSyncedRNGStateCollector)
+
+public:
+	CGlobalSyncedRNGStateCollector() = default;
+
+	void Serialize(creg::ISerializer* s);
+	void PostLoad();
+
+	CGlobalSyncedRNG::rng_val_type initSeed = 0;
+	CGlobalSyncedRNG::rng_val_type lastSeed = 0;
+	CGlobalSyncedRNG::rng_val_type genState = 0;
+};
+
+CR_BIND(CGlobalSyncedRNGStateCollector, )
+CR_REG_METADATA(CGlobalSyncedRNGStateCollector, (
+	CR_MEMBER(initSeed),
+	CR_MEMBER(lastSeed),
+	CR_MEMBER(genState),
+	CR_SERIALIZER(Serialize),
+	CR_POSTLOAD(PostLoad)
+))
+
+void CGlobalSyncedRNGStateCollector::Serialize(creg::ISerializer* s)
+{
+	if (s->IsWriting()) {
+		initSeed = gsRNG.GetInitSeed();
+		lastSeed = gsRNG.GetLastSeed();
+		genState = gsRNG.GetGenState();
+	}
+}
+
+void CGlobalSyncedRNGStateCollector::PostLoad()
+{
+	gsRNG.SetState(initSeed, lastSeed, genState);
+}
+
+using CQTPFSLoadSavePathNode = QTPFS::LoadSavePathNode;
+CR_BIND(CQTPFSLoadSavePathNode, )
+CR_REG_METADATA(CQTPFSLoadSavePathNode, (
+	CR_MEMBER(nodeId),
+	CR_MEMBER(nodeNumber),
+	CR_MEMBER(netPointX),
+	CR_MEMBER(netPointY),
+	CR_MEMBER(pathPointIndex),
+	CR_MEMBER(xmin),
+	CR_MEMBER(zmin),
+	CR_MEMBER(xmax),
+	CR_MEMBER(zmax),
+	CR_MEMBER(badNode)
+))
+
+using CQTPFSLoadSavePathRecord = QTPFS::LoadSavePathRecord;
+CR_BIND(CQTPFSLoadSavePathRecord, )
+CR_REG_METADATA(CQTPFSLoadSavePathRecord, (
+	CR_MEMBER(entityId),
+	CR_MEMBER(kind),
+	CR_MEMBER(ownerId),
+	CR_MEMBER(pathType),
+	CR_MEMBER(nextPointIndex),
+	CR_MEMBER(repathAtPointIndex),
+	CR_MEMBER(numPathUpdates),
+	CR_MEMBER(firstNodeIdOfCleanPath),
+	CR_MEMBER(hashLow),
+	CR_MEMBER(hashHigh),
+	CR_MEMBER(virtualHashLow),
+	CR_MEMBER(virtualHashHigh),
+	CR_MEMBER(radius),
+	CR_MEMBER(synced),
+	CR_MEMBER(haveFullPath),
+	CR_MEMBER(havePartialPath),
+	CR_MEMBER(boundingBoxOverride),
+	CR_MEMBER(isRawPath),
+	CR_MEMBER(hasRequeueComponent),
+	CR_MEMBER(requeueSearch),
+	CR_MEMBER(points),
+	CR_MEMBER(nodes),
+	CR_MEMBER(boundingBoxMins),
+	CR_MEMBER(boundingBoxMaxs),
+	CR_MEMBER(goalPosition)
+))
+
+using CQTPFSLoadSaveState = QTPFS::LoadSaveState;
+CR_BIND(CQTPFSLoadSaveState, )
+CR_REG_METADATA(CQTPFSLoadSaveState, (
+	CR_MEMBER(paths),
+	CR_MEMBER(skippedPendingPaths),
+	CR_MEMBER(skippedUnsyncedPaths)
+))
+
+class CQTPFSStateCollector
+{
+	CR_DECLARE_STRUCT(CQTPFSStateCollector)
+
+public:
+	CQTPFSStateCollector() = default;
+
+	void Serialize(creg::ISerializer* s);
+	void PostLoad();
+
+	QTPFS::LoadSaveState state;
+};
+
+CR_BIND(CQTPFSStateCollector, )
+CR_REG_METADATA(CQTPFSStateCollector, (
+	CR_MEMBER(state),
+	CR_SERIALIZER(Serialize),
+	CR_POSTLOAD(PostLoad)
+))
+
+void CQTPFSStateCollector::Serialize(creg::ISerializer* s)
+{
+	if (!s->IsWriting())
+		return;
+
+	auto* qtpfsPathManager = dynamic_cast<QTPFS::PathManager*>(pathManager);
+	if (qtpfsPathManager == nullptr) {
+		return;
+	}
+
+	qtpfsPathManager->CaptureLoadSaveState(state);
+}
+
+void CQTPFSStateCollector::PostLoad()
+{
+	auto* qtpfsPathManager = dynamic_cast<QTPFS::PathManager*>(pathManager);
+	if (qtpfsPathManager == nullptr) {
+		return;
+	}
+
+	qtpfsPathManager->QueueLoadSaveRestore(state);
+}
+
 class CGameStateCollector
 {
 	CR_DECLARE_STRUCT(CGameStateCollector)
@@ -67,6 +311,15 @@ public:
 	CGameStateCollector() = default;
 
 	void Serialize(creg::ISerializer* s);
+
+private:
+	CLocalConnectionStateCollector localConnectionState;
+#ifdef SYNCCHECK
+	CSyncCheckerStateCollector syncCheckerState;
+#endif
+	CGlobalSyncedRNGStateCollector globalSyncedRNGState;
+	CQTPFSStateCollector qtpfsState;
+	CSelectedUnitsStateCollector selectedUnitsState;
 };
 
 CR_BIND(CGameStateCollector, )
@@ -80,7 +333,15 @@ void CGameStateCollector::Serialize(creg::ISerializer* s)
 	s->SerializeObjectInstance(gs, gs->GetClass());
 	s->SerializeObjectInstance(gu, gu->GetClass());
 	s->SerializeObjectInstance(gameSetup, gameSetup->GetClass());
+	s->SerializeObjectInstance(&playerHandler, playerHandler.GetClass());
 	s->SerializeObjectInstance(game, game->GetClass());
+	s->SerializeObjectInstance(&localConnectionState, localConnectionState.GetClass());
+#ifdef SYNCCHECK
+	s->SerializeObjectInstance(&syncCheckerState, syncCheckerState.GetClass());
+#endif
+	s->SerializeObjectInstance(&globalSyncedRNGState, globalSyncedRNGState.GetClass());
+	s->SerializeObjectInstance(&qtpfsState, qtpfsState.GetClass());
+	s->SerializeObjectInstance(&selectedUnitsState, selectedUnitsState.GetClass());
 	s->SerializeObjectInstance(readMap, readMap->GetClass());
 	s->SerializeObjectInstance(&quadField, quadField.GetClass());
 	s->SerializeObjectInstance(&unitHandler, unitHandler.GetClass());
