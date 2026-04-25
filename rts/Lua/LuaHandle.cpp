@@ -2819,6 +2819,41 @@ DRAW_CALLIN(DrawShadowUnitsLua)
  */
 DRAW_CALLIN(DrawShadowFeaturesLua)
 
+/*** @function Callins:DrawBuildSquare
+ * Called when build square data is computed, before engine rendering.
+ * Grid dimensions can be inferred from UnitDefs[unitDefID].xsize and UnitDefs[unitDefID].zsize.
+ * Grid origin in square coords: x - xsize/2, z - zsize/2 (accounting for facing).
+ * @param unitDefID number
+ * @param x number build position x
+ * @param z number build position z
+ * @param facing number build facing
+ * @param statuses table flat 1D row-major array of BuildSquareStatus values: BLOCKED=0, OCCUPIED=1, RECLAIMABLE=2, OPEN=3
+ */
+void CLuaHandle::DrawBuildSquare(int unitDefID, int x, int z, int facing, const std::vector<uint8_t>& statuses)
+{
+	RECOIL_DETAILED_TRACY_ZONE;
+	LUA_CALL_IN_CHECK(L);
+	luaL_checkstack(L, 8, __func__);
+	static const LuaHashString cmdStr(__func__);
+	if (!cmdStr.GetGlobalFunc(L))
+		return;
+
+	lua_pushnumber(L, unitDefID);
+	lua_pushnumber(L, x);
+	lua_pushnumber(L, z);
+	lua_pushnumber(L, facing);
+
+	lua_createtable(L, statuses.size(), 0);
+	for (size_t i = 0; i < statuses.size(); ++i) {
+		lua_pushinteger(L, statuses[i]);
+		lua_rawseti(L, -2, i + 1);
+	}
+
+	LuaOpenGL::SetDrawingEnabled(L, true);
+	RunCallIn(L, cmdStr, 5, 0);
+	LuaOpenGL::SetDrawingEnabled(L, false);
+}
+
 /***
  * DrawWorldPreParticles is called multiples times per draw frame.
  * Each call has a different permutation of values for drawAboveWater, drawBelowWater, drawReflection, and drawRefraction.
