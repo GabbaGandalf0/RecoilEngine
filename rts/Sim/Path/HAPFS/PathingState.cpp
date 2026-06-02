@@ -106,8 +106,8 @@ void PathingState::Init(std::vector<IPathFinder*> pathFinderlist, PathingState* 
 	 	pathChecksum = 0;
 	 	fileHashCode = CalcHash(__func__);
 
-		offsetBlockNum = {mapDimensionsInBlocks.x * mapDimensionsInBlocks.y};
-		costBlockNum = {mapDimensionsInBlocks.x * mapDimensionsInBlocks.y};
+		offsetBlockNum = mapDimensionsInBlocks.x * mapDimensionsInBlocks.y;
+		costBlockNum = mapDimensionsInBlocks.x * mapDimensionsInBlocks.y;
 
 		vertexCosts.clear();
 		vertexCosts.resize(moveDefHandler.GetNumMoveDefs() * blockStates.GetSize() * PATH_DIRECTION_VERTICES, PATHCOST_INFINITY);
