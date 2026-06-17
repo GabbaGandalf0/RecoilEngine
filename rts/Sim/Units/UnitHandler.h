@@ -4,6 +4,7 @@
 #define UNITHANDLER_H
 
 #include <array>
+#include <cstdint>
 #include <vector>
 
 #include "Sim/Misc/GlobalConstants.h"
@@ -46,6 +47,7 @@ public:
 	unsigned int NumUnitsByTeamAndDef(int teamNum, int unitDefID) const { return (unitsByDefs[teamNum][unitDefID].size()); }
 	unsigned int MaxUnits() const { return maxUnits; }
 	unsigned int CalcMaxUnits() const;
+	uint64_t GetIDPoolDebugDigest() const { return idPool.GetDebugDigest(); }
 
 	float MaxUnitRadius() const { return maxUnitRadius; }
 

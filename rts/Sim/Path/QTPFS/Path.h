@@ -339,6 +339,7 @@ namespace QTPFS {
 		int GetPathType() const { return pathType; }
 
 		std::vector<PathNodeData>& GetNodeList() { return nodes; };
+		const std::vector<PathNodeData>& GetNodeList() const { return nodes; };
 
 		void SetSearchTime(spring_time time) { searchTime = time; }
 
@@ -430,4 +431,3 @@ namespace QTPFS {
 }
 
 #endif
-

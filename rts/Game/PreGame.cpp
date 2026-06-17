@@ -36,6 +36,7 @@
 #include "System/Exceptions.h"
 #include "System/SafeUtil.h"
 #include "System/SpringExitCode.h"
+#include "System/Sync/SHA512.hpp"
 #include "System/TimeProfiler.h"
 #include "System/TdfParser.h"
 #include "System/Input/KeyInput.h"
@@ -58,6 +59,78 @@
 #endif
 
 #include "System/Misc/TracyDefs.h"
+
+namespace {
+
+bool HasConfiguredDigest(const uint8_t* digestBytes)
+{
+	for (size_t i = 0; i < sha512::SHA_LEN; ++i) {
+		if (digestBytes[i] != 0)
+			return true;
+	}
+
+	return false;
+}
+
+sha512::raw_digest ReadConfiguredDigest(const uint8_t* digestBytes)
+{
+	sha512::raw_digest digest{};
+	std::copy(digestBytes, digestBytes + sha512::SHA_LEN, digest.begin());
+	return digest;
+}
+
+std::string ResolveReplayMapArchive(const CGameSetup* setup)
+{
+	const std::string fallbackArchive = setup->mapName;
+
+	if (!HasConfiguredDigest(setup->dsMapHash))
+		return fallbackArchive;
+
+	const sha512::raw_digest desiredDigest = ReadConfiguredDigest(setup->dsMapHash);
+
+	for (const std::string& candidateName: archiveScanner->GetMaps()) {
+		if (archiveScanner->GetArchiveCompleteChecksumBytes(candidateName) != desiredDigest)
+			continue;
+
+		return candidateName;
+	}
+
+	sha512::hex_digest desiredDigestHex;
+	sha512::dump_digest(desiredDigest, desiredDigestHex);
+	LOG_L(L_WARNING, "[PreGame::%s] failed to resolve replay map checksum %s for map \"%s\"; falling back to archive-by-name", __func__, desiredDigestHex.data(), setup->mapName.c_str());
+	return fallbackArchive;
+}
+
+std::string ResolveReplayModArchive(const CGameSetup* setup)
+{
+	const std::string fallbackArchive = setup->modName;
+
+	if (!HasConfiguredDigest(setup->dsModHash))
+		return fallbackArchive;
+
+	const sha512::raw_digest desiredDigest = ReadConfiguredDigest(setup->dsModHash);
+
+	for (const auto& candidate: archiveScanner->GetAllMods()) {
+		if (!candidate.IsGame())
+			continue;
+
+		const std::string candidateName = candidate.GetNameVersioned();
+		if (candidateName.empty())
+			continue;
+
+		if (archiveScanner->GetArchiveCompleteChecksumBytes(candidateName) != desiredDigest)
+			continue;
+
+		return candidateName;
+	}
+
+	sha512::hex_digest desiredDigestHex;
+	sha512::dump_digest(desiredDigest, desiredDigestHex);
+	LOG_L(L_WARNING, "[PreGame::%s] failed to resolve replay mod checksum %s for game \"%s\"; falling back to archive-by-name", __func__, desiredDigestHex.data(), setup->modName.c_str());
+	return fallbackArchive;
+}
+
+}
 
 
 CONFIG(bool, DemoFromDemo).defaultValue(false).description("Enable recording a demo while playing back a demo.");
@@ -248,18 +321,20 @@ bool CPreGame::Update()
 void CPreGame::AddMapArchivesToVFS(const CGameSetup* setup)
 {
 	RECOIL_DETAILED_TRACY_ZONE;
+	const std::string mapArchive = ResolveReplayMapArchive(setup);
 	// map gets added in StartServer if we are the host, so this can show twice
 	// StartServerForDemo does *not* add the map but waits for GameDataReceived
-	LOG("[PreGame::%s][server=%p] using map \"%s\" (loaded=%d cached=%d)", __func__, gameServer, setup->mapName.c_str(), vfsHandler->HasArchive(setup->mapName), vfsHandler->HasTempArchive(setup->mapName));
+	LOG("[PreGame::%s][server=%p] using map \"%s\" via archive \"%s\" (loaded=%d cached=%d)", __func__, gameServer, setup->mapName.c_str(), mapArchive.c_str(), vfsHandler->HasArchive(mapArchive), vfsHandler->HasTempArchive(mapArchive));
 
 	// load map archive
-	vfsHandler->AddArchiveWithDeps(setup->mapName, false);
+	vfsHandler->AddArchiveWithDeps(mapArchive, false);
 }
 
 void CPreGame::AddModArchivesToVFS(const CGameSetup* setup)
 {
 	RECOIL_DETAILED_TRACY_ZONE;
-	LOG("[PreGame::%s][server=%p] using game \"%s\" (loaded=%d cached=%d)", __func__, gameServer, setup->modName.c_str(), vfsHandler->HasArchive(setup->modName), vfsHandler->HasTempArchive(setup->modName));
+	const std::string modArchive = ResolveReplayModArchive(setup);
+	LOG("[PreGame::%s][server=%p] using game \"%s\" via archive \"%s\" (loaded=%d cached=%d)", __func__, gameServer, setup->modName.c_str(), modArchive.c_str(), vfsHandler->HasArchive(modArchive), vfsHandler->HasTempArchive(modArchive));
 
 	// load mutators (if any); use WithDeps since mutators depend on the archives they override
 	for (const std::string& mut: setup->GetMutatorsCont()) {
@@ -269,9 +344,9 @@ void CPreGame::AddModArchivesToVFS(const CGameSetup* setup)
 	}
 
 	// load game archive
-	vfsHandler->AddArchiveWithDeps(setup->modName, false);
+	vfsHandler->AddArchiveWithDeps(modArchive, false);
 
-	modFileName = archiveScanner->ArchiveFromName(setup->modName);
+	modFileName = archiveScanner->ArchiveFromName(modArchive);
 }
 
 void CPreGame::StartServer(const std::string& setupscript)
@@ -310,10 +385,10 @@ void CPreGame::StartServer(const std::string& setupscript)
 	{
 		const auto st = spring_gettime();
 		archiveScanner->ResetNumFilesHashed();
-		const std::string mapArchive = archiveScanner->ArchiveFromName(startGameSetup->mapName);
+		const std::string mapArchive = ResolveReplayMapArchive(startGameSetup.get());
 		const auto mapChecksum = archiveScanner->GetArchiveCompleteChecksumBytes(mapArchive);
 
-		const std::string modArchive = archiveScanner->ArchiveFromName(startGameSetup->modName);
+		const std::string modArchive = ResolveReplayModArchive(startGameSetup.get());
 		const auto modChecksum = archiveScanner->GetArchiveCompleteChecksumBytes(modArchive);
 
 		startGameData->SetMapChecksum(mapChecksum.data());
@@ -656,8 +731,10 @@ void CPreGame::GameDataReceived(std::shared_ptr<const netcode::RawPacket> packet
 		std::snprintf(modChecksumMsgBuf, sizeof(modChecksumMsgBuf), "[PreGame::%s][mod-checksums]\n\tserver=%s\n\tclient=%s", __func__, gdModChecksumHex.data(), asModChecksumHex.data());
 	}
 
-	// script.txt allows to disable demo file recording (host only, used for menu)
-	if (clientSetup->isHost && !gameSetup->recordDemo)
+	// Replaying an existing demo must not create a derived demo. Those files
+	// contain replay-resume metadata and are not valid replacements for the
+	// original BAR replay.
+	if (clientSetup->isHost && (!gameSetup->recordDemo || gameSetup->hostDemo))
 		wantDemo = false;
 
 	if (clientNet != nullptr && wantDemo) {
@@ -689,4 +766,3 @@ bool CPreGame::HasPendingAsyncTask()
 	pendingTask = {};
 	return false;
 }
-

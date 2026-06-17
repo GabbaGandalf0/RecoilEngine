@@ -9,6 +9,7 @@
 #include <cinttypes>
 #include <deque>
 #include <functional>
+#include <sstream>
 
 #include "System/Threading/ThreadPool.h"
 #include "System/Threading/SpringThreading.h"
@@ -27,6 +28,8 @@
 #include "Sim/Misc/TeamHandler.h"
 #include "Sim/MoveTypes/MoveDefHandler.h"
 #include "Sim/MoveTypes/MoveMath/MoveMath.h"
+#include "Sim/Units/Unit.h"
+#include "Sim/Units/UnitHandler.h"
 #include "Sim/Objects/SolidObject.h"
 #include "System/Config/ConfigHandler.h"
 #include "System/FileSystem/ArchiveScanner.h"
@@ -36,6 +39,7 @@
 #include "System/Rectangle.h"
 #include "System/TimeProfiler.h"
 #include "System/StringUtil.h"
+#include "System/UnorderedSet.hpp"
 
 #include "Components/Path.h"
 #include "Components/PathSpeedModInfo.h"
@@ -48,6 +52,9 @@
 #include "Utils/DestroyEntityUtils.h"
 #include "Utils/SyncUpdatedPathsSystemUtils.h"
 #include "Registry.h"
+
+#include "cereal/archives/binary.hpp"
+#include "cereal/types/array.hpp"
 
 #include <assert.h>
 #include "System/Misc/TracyDefs.h"
@@ -63,6 +70,55 @@
 CONFIG(int, PathingThreadCount).defaultValue(0).safemodeValue(1).minimumValue(0);
 
 namespace QTPFS {
+	template<class Archive>
+	void serialize(Archive& ar, NodeLayerSpeedInfoSweep& component)
+	{
+		ar(
+			component.updateMaxNodes,
+			component.updateCurMaxSpeed,
+			component.updateCurSumSpeed,
+			component.updateNumLeafNodes,
+			component.layerNum,
+			component.updateInProgress
+		);
+	}
+
+	template<class Archive>
+	void serialize(Archive& ar, PathSpeedModInfo& component)
+	{
+		ar(component.mean, component.max);
+	}
+
+	template<class Archive>
+	void serialize(Archive& ar, PathSpeedModInfoSystemComponent& component)
+	{
+		ar(
+			component.relSpeedModinfos,
+			component.refreshTimeInFrames,
+			component.startRefreshOnFrame,
+			component.refeshDelayInFrames,
+			component.state
+		);
+	}
+
+	template<class Archive>
+	void serialize(Archive& ar, RemoveDeadPathsComponent& component)
+	{
+		ar(component.refreshRate, component.refreshOffset);
+	}
+
+	template<class Archive>
+	void serialize(Archive& ar, PathRequeueSearch& component)
+	{
+		ar(component.value);
+	}
+
+	template<class Archive>
+	void serialize(Archive& ar, PathDelayedDelete& component)
+	{
+		ar(component.value);
+	}
+
 	struct PMLoadScreen {
 	public:
 		PMLoadScreen() { loadMessages.reserve(8); }
@@ -166,6 +222,9 @@ namespace QTPFS {
 
 		return registry.try_get<UnsyncedIPath>(entityId);
 	};
+
+	static bool pendingLoadSaveRestore = false;
+	static LoadSaveState pendingLoadSaveState;
 }
 
 QTPFS::PathManager::PathManager() {
@@ -1289,12 +1348,23 @@ void QTPFS::PathManager::QueueDeadPathSearches() {
 		auto rate = std::min(updateDirtyPathRate + (updateDirtyPathRemainder-- > 0), (int)pathUpdatesView.size_hint());
 		updateDirtyPathRemainder += (updateDirtyPathRemainder < 0);
 
-		std::for_each_n(pathUpdatesView.begin(), rate, [this, &pathUpdatesView](auto entity) {
+		std::vector<QTPFS::entity> stalePaths;
+		std::for_each_n(pathUpdatesView.begin(), rate, [this, &pathUpdatesView, &stalePaths](auto entity) {
 			assert(registry.valid(entity));
 			IPath* path = &pathUpdatesView.get<IPath>(entity);
+			const CSolidObject* owner = path->GetOwner();
 
-			assert(path->GetPathType() < moveDefHandler.GetNumMoveDefs());
-			const MoveDef* moveDef = moveDefHandler.GetMoveDefByPathType(path->GetPathType());
+			if (owner == nullptr || !owner->objectUsable || owner->moveDef == nullptr || owner->moveDef->pathType != path->GetPathType()) {
+				LOG_L(L_WARNING, "[QTPFS::%s] deleting stale dirty path before requeue: path=%u owner=%p ownerMoveDef=%p pathType=%u",
+					__func__,
+					path->GetID(),
+					owner,
+					(owner != nullptr) ? owner->moveDef : nullptr,
+					path->GetPathType()
+				);
+				stalePaths.emplace_back(entity);
+				return;
+			}
 
 			assert(registry.all_of<PathIsToBeUpdated>(entity));
 			registry.remove<PathIsToBeUpdated>(entity);
@@ -1302,6 +1372,11 @@ void QTPFS::PathManager::QueueDeadPathSearches() {
 
 			RequeueSearch(path, true, false, true);
 		});
+
+		for (const QTPFS::entity entity: stalePaths) {
+			if (registry.valid(entity))
+				DeletePathEntity(entity);
+		}
 	}
 }
 
@@ -1440,7 +1515,15 @@ unsigned int QTPFS::PathManager::RequeueSearch(
 		return (oldPath->GetID());
 
 	const CSolidObject* object = oldPath->GetOwner();
-	if (object != nullptr && object->objectUsable == false) {
+	if (object != nullptr && (object->objectUsable == false || object->moveDef == nullptr || object->moveDef->pathType != oldPath->GetPathType())) {
+		LOG_L(L_WARNING, "[QTPFS::%s] deleting stale path before requeue: path=%u owner=%p ownerMoveDef=%p pathType=%u allowRaw=%d",
+			__func__,
+			oldPath->GetID(),
+			object,
+			(object != nullptr) ? object->moveDef : nullptr,
+			oldPath->GetPathType(),
+			int(allowRawSearch)
+		);
 		DeletePathEntity(pathEntity);
 		return 0;
 	}
@@ -1889,4 +1972,853 @@ int2 QTPFS::PathManager::GetNumQueuedUpdates() const {
 	data.y = updateDirtyPathRemainder;
 
 	return data;
+}
+
+std::uint32_t QTPFS::PathManager::CalculateNodeLayerChecksum() const
+{
+	RECOIL_DETAILED_TRACY_ZONE;
+	std::uint32_t checksum = 0;
+
+	for (size_t layerNum = 0; layerNum < nodeLayers.size(); ++layerNum) {
+		const NodeLayer& nodeLayer = nodeLayers[layerNum];
+		for (int rootNodeNum = 0; rootNodeNum < nodeLayer.GetRootNodeCount(); ++rootNodeNum) {
+			checksum ^= nodeLayer.GetPoolNode(rootNodeNum)->GetCheckSum(nodeLayer);
+		}
+	}
+
+	return checksum;
+}
+
+unsigned int QTPFS::PathManager::GetNumPendingLoadSavePaths() const
+{
+	unsigned int pendingPaths = 0;
+
+	auto countPendingPaths = [this, &pendingPaths](const auto& pathView) {
+		for (const QTPFS::entity entity : pathView) {
+			if (registry.any_of<PathIsTemp, PathSearchRef>(entity))
+				pendingPaths += 1;
+		}
+	};
+
+	countPendingPaths(registry.view<IPath>());
+	countPendingPaths(registry.view<ExternallyManagedSyncedIPath>());
+
+	return pendingPaths;
+}
+
+void QTPFS::PathManager::CaptureLoadSaveState(LoadSaveState& outState) const
+{
+	RECOIL_DETAILED_TRACY_ZONE;
+	outState = LoadSaveState{};
+
+	if (!IsFinalized())
+		return;
+
+	{
+		std::stringstream registryStream;
+		auto archive = cereal::BinaryOutputArchive{registryStream};
+
+		entt::basic_snapshot<QTPFS::entity>{registry}
+			.entities(archive)
+			.component<
+				NodeLayerSpeedInfoSweep,
+				PathSpeedModInfoSystemComponent,
+				RemoveDeadPathsComponent,
+				PathIsDirty,
+				PathIsToBeUpdated,
+				PathUpdatedCounterIncrease,
+				PathRequeueSearch,
+				PathDelayedDelete
+			>(archive);
+
+		archive(systemGlobals);
+
+		const std::string registryBytes = registryStream.str();
+		outState.registryEntitySnapshot.assign(registryBytes.begin(), registryBytes.end());
+	}
+
+	auto capturePathRecord = [&outState, this](QTPFS::entity entity, const IPath& path, int kind) {
+		LoadSavePathRecord record;
+		const CSolidObject* owner = path.GetOwner();
+
+		record.entityId = entt::to_integral(entity);
+		record.kind = kind;
+		record.ownerId = (owner != nullptr) ? owner->id : -1;
+		record.ownerTeam = (owner != nullptr) ? owner->team : -1;
+		record.ownerCreationFrame = (owner != nullptr) ? owner->creationFrame : -1;
+		record.ownerMoveDefPathType = (owner != nullptr && owner->moveDef != nullptr) ? owner->moveDef->pathType : -1;
+		record.pathType = path.GetPathType();
+		record.nextPointIndex = path.GetNextPointIndex();
+		record.repathAtPointIndex = path.GetRepathTriggerIndex();
+		record.numPathUpdates = path.GetNumPathUpdates();
+		record.firstNodeIdOfCleanPath = path.GetFirstNodeIdOfCleanPath();
+		record.hashLow = path.GetHash().GetLow();
+		record.hashHigh = path.GetHash().GetHigh();
+		record.virtualHashLow = path.GetVirtualHash().GetLow();
+		record.virtualHashHigh = path.GetVirtualHash().GetHigh();
+		record.radius = path.GetRadius();
+		record.synced = path.IsSynced();
+		record.haveFullPath = path.IsFullPath();
+		record.havePartialPath = path.IsPartialPath();
+		record.boundingBoxOverride = path.IsBoundingBoxOverriden();
+		record.isRawPath = path.IsRawPath();
+		record.hasRequeueComponent = registry.all_of<PathRequeueSearch>(entity);
+		record.requeueSearch = record.hasRequeueComponent ? registry.get<PathRequeueSearch>(entity).value : false;
+		record.hasDirtyComponent = registry.all_of<PathIsDirty>(entity);
+		record.hasToBeUpdatedComponent = registry.all_of<PathIsToBeUpdated>(entity);
+		record.wasTempPath = registry.all_of<PathIsTemp>(entity);
+		record.hadSearchRef = registry.all_of<PathSearchRef>(entity);
+		record.hadUpdatedCounterIncrease = registry.all_of<PathUpdatedCounterIncrease>(entity);
+		record.boundingBoxMins = path.GetBoundingBoxMins();
+		record.boundingBoxMaxs = path.GetBoundingBoxMaxs();
+		record.goalPosition = path.GetGoalPosition();
+
+		if (const SharedPathChain* chain = registry.try_get<SharedPathChain>(entity); chain != nullptr) {
+			record.hasSharedPathChain = true;
+			record.sharedPathPrevId = entt::to_integral(chain->prev);
+			record.sharedPathNextId = entt::to_integral(chain->next);
+
+			const auto headIt = sharedPaths.find(path.GetHash());
+			record.isSharedPathHead = (headIt != sharedPaths.end() && headIt->second == entity);
+		}
+
+		if (const PartialSharedPathChain* chain = registry.try_get<PartialSharedPathChain>(entity); chain != nullptr) {
+			record.hasPartialSharedPathChain = true;
+			record.partialSharedPathPrevId = entt::to_integral(chain->prev);
+			record.partialSharedPathNextId = entt::to_integral(chain->next);
+
+			const auto headIt = partialSharedPaths.find(path.GetVirtualHash());
+			record.isPartialSharedPathHead = (headIt != partialSharedPaths.end() && headIt->second == entity);
+		}
+
+		if (record.wasTempPath || record.hadSearchRef)
+			outState.skippedPendingPaths += 1;
+
+		if (record.hadSearchRef) {
+			const PathSearchRef& searchRef = registry.get<PathSearchRef>(entity);
+			const PathSearch* pendingSearch = GetSearch(searchRef.value);
+
+			if (pendingSearch != nullptr) {
+				record.pendingSearchRawPathCheck = pendingSearch->rawPathCheck;
+				record.pendingSearchAllowPartialSearch = pendingSearch->allowPartialSearch;
+				record.pendingSearchTryPathRepair = pendingSearch->tryPathRepair;
+			}
+		}
+
+		record.points.reserve(path.NumPoints());
+		for (unsigned int pointIdx = 0; pointIdx < path.NumPoints(); ++pointIdx) {
+			record.points.emplace_back(path.GetPoint(pointIdx));
+		}
+
+		const auto& pathNodes = path.GetNodeList();
+		record.nodes.reserve(pathNodes.size());
+		for (const auto& node : pathNodes) {
+			LoadSavePathNode savedNode;
+			savedNode.nodeId = node.nodeId;
+			savedNode.nodeNumber = node.nodeNumber;
+			savedNode.netPointX = node.netPoint.x;
+			savedNode.netPointY = node.netPoint.y;
+			savedNode.pathPointIndex = node.pathPointIndex;
+			savedNode.xmin = node.xmin;
+			savedNode.zmin = node.zmin;
+			savedNode.xmax = node.xmax;
+			savedNode.zmax = node.zmax;
+			savedNode.badNode = node.badNode;
+			record.nodes.emplace_back(savedNode);
+		}
+
+		outState.paths.emplace_back(std::move(record));
+	};
+
+	// EnTT iterates sparse-set storages in reverse packed order. Save records in
+	// packed order so emplacing them during restore reconstructs the exact
+	// iteration order used by path updates and entity allocation.
+	const auto syncedPathView = registry.view<IPath>();
+	for (auto it = syncedPathView.rbegin(); it != syncedPathView.rend(); ++it) {
+		const QTPFS::entity entity = *it;
+		capturePathRecord(entity, syncedPathView.get<IPath>(entity), LoadSavePathRecord::KIND_SYNCED);
+	}
+
+	const auto externalPathView = registry.view<ExternallyManagedSyncedIPath>();
+	for (auto it = externalPathView.rbegin(); it != externalPathView.rend(); ++it) {
+		const QTPFS::entity entity = *it;
+		capturePathRecord(entity, externalPathView.get<ExternallyManagedSyncedIPath>(entity), LoadSavePathRecord::KIND_EXTERNAL_SYNCED);
+	}
+
+	outState.skippedUnsyncedPaths = static_cast<unsigned int>(registry.storage<UnsyncedIPath>().size());
+	outState.updateDirtyPathRate = updateDirtyPathRate;
+	outState.updateDirtyPathRemainder = updateDirtyPathRemainder;
+	outState.refreshDirtyPathRateFrame = refreshDirtyPathRateFrame;
+	outState.pfsChecksum = pfsCheckSum;
+	outState.nodeLayerChecksum = CalculateNodeLayerChecksum();
+	outState.damageTrackWidth = nodeLayersMapDamageTrack.width;
+	outState.damageTrackHeight = nodeLayersMapDamageTrack.height;
+	outState.damageTrackCellSize = nodeLayersMapDamageTrack.cellSize;
+
+	outState.nodeLayerStates.reserve(nodeLayers.size());
+	for (const NodeLayer& nodeLayer : nodeLayers) {
+		LoadSaveNodeLayerState nodeLayerState;
+		nodeLayer.CaptureLoadSaveState(nodeLayerState);
+		outState.nodeLayerStates.emplace_back(std::move(nodeLayerState));
+	}
+
+	outState.mapChangeTrackers.reserve(nodeLayersMapDamageTrack.mapChangeTrackers.size());
+	for (const MapChangeTrack& mapChangeTrack : nodeLayersMapDamageTrack.mapChangeTrackers) {
+		LoadSaveMapChangeTrack savedMapChangeTrack;
+		savedMapChangeTrack.damageMap.reserve(mapChangeTrack.damageMap.size());
+		for (const bool damaged : mapChangeTrack.damageMap) {
+			savedMapChangeTrack.damageMap.emplace_back(damaged ? 1 : 0);
+		}
+
+		savedMapChangeTrack.damageQueue.reserve(mapChangeTrack.damageQueue.size());
+		for (const int damageCell : mapChangeTrack.damageQueue) {
+			savedMapChangeTrack.damageQueue.emplace_back(damageCell);
+		}
+
+		outState.mapChangeTrackers.emplace_back(std::move(savedMapChangeTrack));
+	}
+
+	LOG("[QTPFS::%s] captured compact full snapshot: paths=%u pendingPathRecords=%u nodeLayers=%u mapChangeTrackers=%u registryBytes=%u registryAlive=%u registrySize=%u dirtyRefreshFrame=%d baseChecksum=%08x snapshotChecksum=%08x",
+		__func__,
+		static_cast<unsigned int>(outState.paths.size()),
+		outState.skippedPendingPaths,
+		static_cast<unsigned int>(outState.nodeLayerStates.size()),
+		static_cast<unsigned int>(outState.mapChangeTrackers.size()),
+		static_cast<unsigned int>(outState.registryEntitySnapshot.size()),
+		static_cast<unsigned int>(registry.alive()),
+		static_cast<unsigned int>(registry.size()),
+		outState.refreshDirtyPathRateFrame,
+		outState.pfsChecksum,
+		outState.nodeLayerChecksum
+	);
+}
+
+void QTPFS::PathManager::QueueLoadSaveRestore(const LoadSaveState& state)
+{
+	RECOIL_DETAILED_TRACY_ZONE;
+	pendingLoadSaveState = state;
+	pendingLoadSaveRestore = true;
+}
+
+bool QTPFS::PathManager::HasQueuedFullLoadSaveState() const
+{
+	RECOIL_DETAILED_TRACY_ZONE;
+	return (
+		pendingLoadSaveRestore &&
+		!pendingLoadSaveState.nodeLayerStates.empty() &&
+		(pendingLoadSaveState.nodeLayerStates.size() == nodeLayers.size())
+	);
+}
+
+bool QTPFS::PathManager::ConsumeLoadSavePostLoadRefreshSkip()
+{
+	RECOIL_DETAILED_TRACY_ZONE;
+	const bool skipRefresh = loadSaveRestoreSkipPostLoadRefresh;
+	loadSaveRestoreSkipPostLoadRefresh = false;
+	return skipRefresh;
+}
+
+bool QTPFS::PathManager::HasLivePath(unsigned int pathID, bool requireSynced) const
+{
+	RECOIL_DETAILED_TRACY_ZONE;
+	const QTPFS::entity pathEntity = static_cast<QTPFS::entity>(pathID);
+	const IPath* livePath = GetPath(pathEntity);
+
+	if (livePath == nullptr)
+		return false;
+	if (requireSynced && !livePath->IsSynced())
+		return false;
+	if (registry.any_of<PathIsTemp>(pathEntity))
+		return false;
+
+	return true;
+}
+
+bool QTPFS::PathManager::HasLivePathForOwner(unsigned int pathID, const CSolidObject* owner, bool requireSynced) const
+{
+	RECOIL_DETAILED_TRACY_ZONE;
+	const QTPFS::entity pathEntity = static_cast<QTPFS::entity>(pathID);
+	const IPath* livePath = GetPath(pathEntity);
+
+	if (livePath == nullptr)
+		return false;
+	if (requireSynced && !livePath->IsSynced())
+		return false;
+	if (registry.any_of<PathIsTemp>(pathEntity))
+		return false;
+	if (livePath->GetOwner() != owner)
+		return false;
+	if (owner == nullptr || owner->moveDef == nullptr)
+		return false;
+	if (livePath->GetPathType() != owner->moveDef->pathType)
+		return false;
+
+	return true;
+}
+
+// Like HasLivePathForOwner but does NOT require the path's owner-pointer to match.
+// Used during rewind restore to accept "secondary path-sharers": units whose creg-restored
+// pathID points to a live path that was originally owned by a different unit (because QTPFS
+// path-sharing assigns multiple units the same path entity). Without this check those units
+// would have their paths rebuilt from scratch, causing waypoint divergence vs. the reference.
+bool QTPFS::PathManager::HasCompatibleLivePath(unsigned int pathID, const CSolidObject* owner, bool requireSynced) const
+{
+	RECOIL_DETAILED_TRACY_ZONE;
+	const QTPFS::entity pathEntity = static_cast<QTPFS::entity>(pathID);
+	const IPath* livePath = GetPath(pathEntity);
+
+	if (livePath == nullptr)
+		return false;
+	if (requireSynced && !livePath->IsSynced())
+		return false;
+	if (registry.any_of<PathIsTemp>(pathEntity))
+		return false;
+	if (owner == nullptr || owner->moveDef == nullptr)
+		return false;
+	if (livePath->GetPathType() != owner->moveDef->pathType)
+		return false;
+
+	return true;
+}
+
+void QTPFS::PathManager::ApplyLoadSaveRestore()
+{
+	RECOIL_DETAILED_TRACY_ZONE;
+	if (!pendingLoadSaveRestore)
+		return;
+	if (!IsFinalized()) {
+		LOG_L(L_WARNING, "[QTPFS::%s] path manager is not finalized yet, keeping queued restore", __func__);
+		return;
+	}
+
+	auto clearPathTraces = [this]() {
+		for (auto& [pathID, trace] : pathTraces) {
+			delete trace;
+		}
+		pathTraces.clear();
+	};
+
+	clearPathTraces();
+	sharedPaths.clear();
+	partialSharedPaths.clear();
+
+	bool restoredRegistryEntitySnapshot = false;
+	if (!pendingLoadSaveState.registryEntitySnapshot.empty()) {
+		std::string registryBytes(
+			pendingLoadSaveState.registryEntitySnapshot.begin(),
+			pendingLoadSaveState.registryEntitySnapshot.end()
+		);
+		std::stringstream registryStream(registryBytes);
+		auto archive = cereal::BinaryInputArchive{registryStream};
+
+		registry.clear();
+
+		entt::basic_snapshot_loader<QTPFS::entity>{registry}
+			.entities(archive)
+			.component<
+				NodeLayerSpeedInfoSweep,
+				PathSpeedModInfoSystemComponent,
+				RemoveDeadPathsComponent,
+				PathIsDirty,
+				PathIsToBeUpdated,
+				PathUpdatedCounterIncrease,
+				PathRequeueSearch,
+				PathDelayedDelete
+			>(archive);
+
+		archive(systemGlobals);
+
+		restoredRegistryEntitySnapshot = true;
+		LOG("[QTPFS::%s] restored QTPFS registry entity snapshot: bytes=%u alive=%u size=%u",
+			__func__,
+			static_cast<unsigned int>(pendingLoadSaveState.registryEntitySnapshot.size()),
+			static_cast<unsigned int>(registry.alive()),
+			static_cast<unsigned int>(registry.size())
+		);
+	}
+
+	spring::unordered_set<QTPFS::entity> restorePathEntities;
+	restorePathEntities.reserve(pendingLoadSaveState.paths.size());
+
+	for (const LoadSavePathRecord& record : pendingLoadSaveState.paths) {
+		if (record.entityId > 0 && record.points.size() >= 2)
+			restorePathEntities.insert(static_cast<QTPFS::entity>(record.entityId));
+	}
+
+	std::vector<QTPFS::entity> entitiesToDestroy;
+	registry.each([&entitiesToDestroy](QTPFS::entity entity) {
+		if (registry.any_of<
+			IPath,
+			ExternallyManagedSyncedIPath,
+			UnsyncedIPath,
+			PathSearch,
+			ExternallyManagedPathSearch,
+			UnsyncedPathSearch,
+			SharedPathChain,
+			PartialSharedPathChain,
+			PathIsTemp,
+			PathIsDirty,
+			PathIsToBeUpdated,
+			PathUpdatedCounterIncrease,
+			ProcessPath,
+			PathSearchRef,
+			PathRequeueSearch,
+			PathDelayedDelete
+		>(entity)) {
+			entitiesToDestroy.emplace_back(entity);
+		}
+	});
+
+	auto removePathComponents = [](const QTPFS::entity entity) {
+		if (registry.any_of<IPath>(entity)) registry.remove<IPath>(entity);
+		if (registry.any_of<ExternallyManagedSyncedIPath>(entity)) registry.remove<ExternallyManagedSyncedIPath>(entity);
+		if (registry.any_of<UnsyncedIPath>(entity)) registry.remove<UnsyncedIPath>(entity);
+		if (registry.any_of<PathSearch>(entity)) registry.remove<PathSearch>(entity);
+		if (registry.any_of<ExternallyManagedPathSearch>(entity)) registry.remove<ExternallyManagedPathSearch>(entity);
+		if (registry.any_of<UnsyncedPathSearch>(entity)) registry.remove<UnsyncedPathSearch>(entity);
+		if (registry.any_of<SharedPathChain>(entity)) registry.remove<SharedPathChain>(entity);
+		if (registry.any_of<PartialSharedPathChain>(entity)) registry.remove<PartialSharedPathChain>(entity);
+		if (registry.any_of<PathIsTemp>(entity)) registry.remove<PathIsTemp>(entity);
+		if (registry.any_of<PathIsDirty>(entity)) registry.remove<PathIsDirty>(entity);
+		if (registry.any_of<PathIsToBeUpdated>(entity)) registry.remove<PathIsToBeUpdated>(entity);
+		if (registry.any_of<PathUpdatedCounterIncrease>(entity)) registry.remove<PathUpdatedCounterIncrease>(entity);
+		if (registry.any_of<ProcessPath>(entity)) registry.remove<ProcessPath>(entity);
+		if (registry.any_of<PathSearchRef>(entity)) registry.remove<PathSearchRef>(entity);
+		if (registry.any_of<PathRequeueSearch>(entity)) registry.remove<PathRequeueSearch>(entity);
+		if (registry.any_of<PathDelayedDelete>(entity)) registry.remove<PathDelayedDelete>(entity);
+	};
+
+	if (!restoredRegistryEntitySnapshot) {
+		for (const QTPFS::entity entity : entitiesToDestroy) {
+			if (!registry.valid(entity))
+				continue;
+
+			if (restorePathEntities.contains(entity)) {
+				removePathComponents(entity);
+			} else {
+				registry.destroy(entity);
+			}
+		}
+	}
+
+	updateDirtyPathRate = 0;
+	updateDirtyPathRemainder = 0;
+	loadSaveRestoreNodeLayerChecksumMismatch = false;
+	loadSaveRestoreNeedsGroundPathRebuild = false;
+	loadSaveRestoreSkipPostLoadRefresh = false;
+	bool restoredNodeLayerChecksumMismatch = false;
+
+	auto rebuildSearchCachesFromNodeLayers = [this, restoredRegistryEntitySnapshot]() {
+		int maxAllocedNodes = 0;
+
+		for (size_t layerNum = 0; layerNum < nodeLayers.size(); ++layerNum) {
+			auto& nodeLayer = nodeLayers[layerNum];
+			maxAllocedNodes = std::max(maxAllocedNodes, nodeLayer.GetMaxNodesAlloced());
+		}
+
+		searchThreadData.clear();
+		int threads = ThreadPool::GetNumThreads();
+		searchThreadData.reserve(threads);
+		while (threads-- > 0) {
+			searchThreadData.emplace_back(SearchThreadData(maxAllocedNodes, threads));
+		}
+
+		if (!restoredRegistryEntitySnapshot)
+			PathSpeedModInfoSystem::Init();
+	};
+
+	const bool haveFullNodeLayerState = HasQueuedFullLoadSaveState();
+	if (haveFullNodeLayerState) {
+		const bool haveMapChangeTrackers = (pendingLoadSaveState.mapChangeTrackers.size() == nodeLayersMapDamageTrack.mapChangeTrackers.size());
+
+		const std::uint32_t savedNodeLayerChecksum = (pendingLoadSaveState.nodeLayerChecksum != 0) ? pendingLoadSaveState.nodeLayerChecksum : pendingLoadSaveState.pfsChecksum;
+
+	LOG("[QTPFS::%s] restoring full QTPFS snapshot: layers=%u damageTrackers=%u/%u dirtyRate=%d dirtyRemainder=%d dirtyRefreshFrame=%d baseChecksum=%08x snapshotChecksum=%08x",
+			__func__,
+			static_cast<unsigned int>(pendingLoadSaveState.nodeLayerStates.size()),
+			static_cast<unsigned int>(pendingLoadSaveState.mapChangeTrackers.size()),
+			static_cast<unsigned int>(nodeLayersMapDamageTrack.mapChangeTrackers.size()),
+			pendingLoadSaveState.updateDirtyPathRate,
+			pendingLoadSaveState.updateDirtyPathRemainder,
+			pendingLoadSaveState.refreshDirtyPathRateFrame,
+			pendingLoadSaveState.pfsChecksum,
+			savedNodeLayerChecksum
+		);
+
+		nodeLayersMapDamageTrack.width = pendingLoadSaveState.damageTrackWidth;
+		nodeLayersMapDamageTrack.height = pendingLoadSaveState.damageTrackHeight;
+		nodeLayersMapDamageTrack.cellSize = pendingLoadSaveState.damageTrackCellSize;
+
+		for (size_t layerNum = 0; layerNum < nodeLayers.size(); ++layerNum) {
+			nodeLayers[layerNum].RestoreLoadSaveState(pendingLoadSaveState.nodeLayerStates[layerNum]);
+		}
+
+		if (haveMapChangeTrackers) {
+			for (size_t layerNum = 0; layerNum < nodeLayersMapDamageTrack.mapChangeTrackers.size(); ++layerNum) {
+				auto& dstTrack = nodeLayersMapDamageTrack.mapChangeTrackers[layerNum];
+				const auto& srcTrack = pendingLoadSaveState.mapChangeTrackers[layerNum];
+
+				dstTrack.damageMap.assign(srcTrack.damageMap.size(), false);
+				for (size_t i = 0; i < srcTrack.damageMap.size(); ++i) {
+					dstTrack.damageMap[i] = (srcTrack.damageMap[i] != 0);
+				}
+
+				dstTrack.damageQueue.clear();
+				for (const int damageCell: srcTrack.damageQueue) {
+					dstTrack.damageQueue.emplace_back(damageCell);
+				}
+			}
+		} else {
+			LOG_L(L_WARNING, "[QTPFS::%s] saved map-change tracker count (%u) does not match live count (%u); node layers restored, tracker queues kept from initialized path manager",
+				__func__,
+				static_cast<unsigned int>(pendingLoadSaveState.mapChangeTrackers.size()),
+				static_cast<unsigned int>(nodeLayersMapDamageTrack.mapChangeTrackers.size())
+			);
+		}
+
+		const std::uint32_t restoredChecksum = CalculateNodeLayerChecksum();
+		rebuildSearchCachesFromNodeLayers();
+		const bool checksumMismatch = (
+			savedNodeLayerChecksum != 0 &&
+			restoredChecksum != savedNodeLayerChecksum
+		);
+
+		if (checksumMismatch) {
+			restoredNodeLayerChecksumMismatch = true;
+			loadSaveRestoreNodeLayerChecksumMismatch = true;
+			LOG("[QTPFS::%s] restored node-layer checksum differs from saved snapshot checksum: saved=%08x restored=%08x; preserving loaded full snapshot",
+				__func__, savedNodeLayerChecksum, restoredChecksum);
+		}
+
+		updateDirtyPathRate = pendingLoadSaveState.updateDirtyPathRate;
+		updateDirtyPathRemainder = pendingLoadSaveState.updateDirtyPathRemainder;
+		refreshDirtyPathRateFrame = pendingLoadSaveState.refreshDirtyPathRateFrame;
+		pfsCheckSum = (pendingLoadSaveState.nodeLayerChecksum != 0) ? pendingLoadSaveState.pfsChecksum : pfsCheckSum;
+		loadSaveRestoreSkipPostLoadRefresh = true;
+	} else {
+		LOG("[QTPFS::%s] restoring path-only QTPFS snapshot; node layers will rely on post-load refresh", __func__);
+	}
+
+	std::vector<QTPFS::entity> restoredPaths;
+	restoredPaths.reserve(pendingLoadSaveState.paths.size());
+	unsigned int droppedPendingPathRecords = 0;
+	unsigned int droppedInvalidOwnerPathRecords = 0;
+
+	auto resolveRestoredPathOwner = [](const LoadSavePathRecord& record) -> CUnit* {
+		if (record.ownerId < 0)
+			return nullptr;
+		if (record.ownerMoveDefPathType < 0)
+			return nullptr;
+		if (record.ownerMoveDefPathType != record.pathType)
+			return nullptr;
+
+		CUnit* unit = unitHandler.GetUnit(record.ownerId);
+		if (unit == nullptr || unit->moveDef == nullptr)
+			return nullptr;
+		if (unit->moveDef->pathType != record.ownerMoveDefPathType)
+			return nullptr;
+		if (record.ownerTeam >= 0 && unit->team != record.ownerTeam)
+			return nullptr;
+		if (record.ownerCreationFrame >= 0 && unit->creationFrame != record.ownerCreationFrame)
+			return nullptr;
+
+		return unit;
+	};
+
+	if (restoredNodeLayerChecksumMismatch) {
+		LOG("[QTPFS::%s] skipping restore of %u saved synced path records after node-layer checksum mismatch; active ground units will request fresh paths from the loaded move-state",
+			__func__,
+			static_cast<unsigned int>(pendingLoadSaveState.paths.size())
+		);
+	}
+
+	for (const LoadSavePathRecord& record : pendingLoadSaveState.paths) {
+		if (restoredNodeLayerChecksumMismatch)
+			break;
+
+		if (record.wasTempPath || record.hadSearchRef) {
+			droppedPendingPathRecords += 1;
+			loadSaveRestoreNeedsGroundPathRebuild = true;
+			continue;
+		}
+
+		if (record.entityId <= 0 || record.points.size() < 2) {
+			LOG_L(L_WARNING, "[QTPFS::%s] skipping invalid saved path entity=%d points=%u",
+				__func__, record.entityId, static_cast<unsigned int>(record.points.size()));
+			continue;
+		}
+
+		CUnit* restoredOwner = resolveRestoredPathOwner(record);
+		if (record.kind == LoadSavePathRecord::KIND_SYNCED && record.ownerId >= 0 && restoredOwner == nullptr) {
+			droppedInvalidOwnerPathRecords += 1;
+			loadSaveRestoreNeedsGroundPathRebuild = true;
+
+			if (droppedInvalidOwnerPathRecords <= 8) {
+				LOG_L(L_WARNING, "[QTPFS::%s] dropping saved synced path with invalid owner: entity=%d ownerId=%d ownerTeam=%d ownerFrame=%d ownerPathType=%d pathType=%d",
+					__func__,
+					record.entityId,
+					record.ownerId,
+					record.ownerTeam,
+					record.ownerCreationFrame,
+					record.ownerMoveDefPathType,
+					record.pathType
+				);
+			}
+			continue;
+		}
+
+		const QTPFS::entity wantedEntity = static_cast<QTPFS::entity>(record.entityId);
+		QTPFS::entity createdEntity = wantedEntity;
+
+		if (!registry.valid(createdEntity)) {
+			using EntityTraits = entt::entt_traits<QTPFS::entity>;
+			const QTPFS::entity currentEntityForSlot = EntityTraits::construct(
+				EntityTraits::to_entity(wantedEntity),
+				registry.current(wantedEntity)
+			);
+
+			if (registry.valid(currentEntityForSlot) && currentEntityForSlot != wantedEntity) {
+				registry.destroy(currentEntityForSlot);
+			}
+
+			createdEntity = registry.create(wantedEntity);
+		}
+
+		if (createdEntity != wantedEntity) {
+			LOG_L(L_WARNING, "[QTPFS::%s] failed to restore path entity %d, got %d instead",
+				__func__, record.entityId, entt::to_integral(createdEntity));
+			if (registry.valid(createdEntity))
+				registry.destroy(createdEntity);
+			continue;
+		}
+
+		IPath* path = nullptr;
+		switch (record.kind) {
+			case LoadSavePathRecord::KIND_EXTERNAL_SYNCED:
+				path = &registry.emplace<ExternallyManagedSyncedIPath>(createdEntity);
+				break;
+			case LoadSavePathRecord::KIND_SYNCED:
+			default:
+				path = &registry.emplace<IPath>(createdEntity);
+				break;
+		}
+
+		path->SetID(record.entityId);
+		path->SetPathType(record.pathType);
+		path->SetRadius(record.radius);
+		path->SetSynced(record.synced);
+		path->SetHasFullPath(record.haveFullPath);
+		path->SetHasPartialPath(record.havePartialPath);
+		path->SetNextPointIndex(record.nextPointIndex);
+		path->SetRepathTriggerIndex(record.repathAtPointIndex);
+		path->SetNumPathUpdates(record.numPathUpdates);
+		path->SetFirstNodeIdOfCleanPath(record.firstNodeIdOfCleanPath);
+		path->SetHash(PathHashType(record.hashLow, record.hashHigh));
+		path->SetVirtualHash(PathHashType(record.virtualHashLow, record.virtualHashHigh));
+		path->SetGoalPosition(record.goalPosition);
+		path->SetIsRawPath(record.isRawPath);
+		path->SetOwner(restoredOwner);
+
+		path->AllocPoints(record.points.size());
+		for (unsigned int pointIdx = 0; pointIdx < record.points.size(); ++pointIdx) {
+			path->SetPoint(pointIdx, record.points[pointIdx]);
+		}
+
+		path->AllocNodes(record.nodes.size());
+		for (unsigned int nodeIdx = 0; nodeIdx < record.nodes.size(); ++nodeIdx) {
+			const auto& savedNode = record.nodes[nodeIdx];
+			path->SetNode(nodeIdx, savedNode.nodeId, savedNode.nodeNumber, float2(savedNode.netPointX, savedNode.netPointY), savedNode.pathPointIndex, savedNode.badNode);
+			path->SetNodeBoundary(nodeIdx, savedNode.xmin, savedNode.zmin, savedNode.xmax, savedNode.zmax);
+		}
+
+		if (record.boundingBoxOverride) {
+			path->SetBoundingBox(record.boundingBoxMins, record.boundingBoxMaxs);
+		} else {
+			path->SetBoundingBox();
+		}
+
+		if (!restoredRegistryEntitySnapshot && record.kind == LoadSavePathRecord::KIND_SYNCED && record.hasRequeueComponent) {
+			registry.emplace<PathRequeueSearch>(createdEntity, record.requeueSearch);
+		}
+
+		if (!restoredRegistryEntitySnapshot) {
+			if (!restoredNodeLayerChecksumMismatch) {
+				if (record.hasDirtyComponent)
+					registry.emplace<PathIsDirty>(createdEntity);
+				if (record.hasToBeUpdatedComponent)
+					registry.emplace<PathIsToBeUpdated>(createdEntity);
+				if (record.hadUpdatedCounterIncrease)
+					registry.emplace<PathUpdatedCounterIncrease>(createdEntity);
+			} else if (record.hasDirtyComponent || record.hasToBeUpdatedComponent || record.hadUpdatedCounterIncrease || record.hadSearchRef) {
+				LOG("[QTPFS::%s] dropping deferred path-update state for restored path entity=%d after node-layer checksum mismatch (dirty=%d toBeUpdated=%d updatedCounter=%d searchRef=%d)",
+					__func__,
+					record.entityId,
+					int(record.hasDirtyComponent),
+					int(record.hasToBeUpdatedComponent),
+					int(record.hadUpdatedCounterIncrease),
+					int(record.hadSearchRef)
+				);
+			}
+		}
+
+		restoredPaths.emplace_back(createdEntity);
+	}
+
+	if (droppedPendingPathRecords > 0) {
+		LOG("[QTPFS::%s] dropped %u pending path records during rewind restore; active ground move-types will rebuild their paths from restored command state",
+			__func__,
+			droppedPendingPathRecords
+		);
+	}
+	if (droppedInvalidOwnerPathRecords > 0) {
+		LOG("[QTPFS::%s] dropped %u saved synced path records with invalid restored owners; active ground move-types will rebuild those paths from restored command state",
+			__func__,
+			droppedInvalidOwnerPathRecords
+		);
+	}
+
+	auto tryRestoreSavedPathChains = [this]() {
+		bool restoredSharedChains = false;
+		bool restoredPartialSharedChains = false;
+
+		for (const LoadSavePathRecord& record : pendingLoadSaveState.paths) {
+			if (!record.hasSharedPathChain)
+				continue;
+
+			const QTPFS::entity entity = static_cast<QTPFS::entity>(record.entityId);
+			const QTPFS::entity prev = static_cast<QTPFS::entity>(record.sharedPathPrevId);
+			const QTPFS::entity next = static_cast<QTPFS::entity>(record.sharedPathNextId);
+			IPath* path = registry.try_get<IPath>(entity);
+
+			if (path == nullptr || !registry.valid(prev) || !registry.valid(next) || !registry.all_of<IPath>(prev) || !registry.all_of<IPath>(next)) {
+				LOG_L(L_WARNING, "[QTPFS::%s] saved shared-path chain is incomplete for entity=%d; falling back to grouped chain restore",
+					__func__, record.entityId);
+				return false;
+			}
+			if (path->GetHash() == BAD_HASH) {
+				LOG_L(L_WARNING, "[QTPFS::%s] saved shared-path chain has BAD_HASH for entity=%d; falling back to grouped chain restore",
+					__func__, record.entityId);
+				return false;
+			}
+
+			registry.emplace<SharedPathChain>(entity, prev, next);
+			if (record.isSharedPathHead)
+				sharedPaths[path->GetHash()] = entity;
+
+			restoredSharedChains = true;
+		}
+
+		for (const LoadSavePathRecord& record : pendingLoadSaveState.paths) {
+			if (!record.hasPartialSharedPathChain)
+				continue;
+
+			const QTPFS::entity entity = static_cast<QTPFS::entity>(record.entityId);
+			const QTPFS::entity prev = static_cast<QTPFS::entity>(record.partialSharedPathPrevId);
+			const QTPFS::entity next = static_cast<QTPFS::entity>(record.partialSharedPathNextId);
+			IPath* path = registry.try_get<IPath>(entity);
+
+			if (path == nullptr || !registry.valid(prev) || !registry.valid(next) || !registry.all_of<IPath>(prev) || !registry.all_of<IPath>(next)) {
+				LOG_L(L_WARNING, "[QTPFS::%s] saved partial-shared-path chain is incomplete for entity=%d; falling back to grouped chain restore",
+					__func__, record.entityId);
+				return false;
+			}
+			if (path->GetVirtualHash() == BAD_HASH) {
+				LOG_L(L_WARNING, "[QTPFS::%s] saved partial-shared-path chain has BAD_HASH for entity=%d; falling back to grouped chain restore",
+					__func__, record.entityId);
+				return false;
+			}
+
+			registry.emplace<PartialSharedPathChain>(entity, prev, next);
+			if (record.isPartialSharedPathHead)
+				partialSharedPaths[path->GetVirtualHash()] = entity;
+
+			restoredPartialSharedChains = true;
+		}
+
+		if (restoredSharedChains || restoredPartialSharedChains) {
+			LOG("[QTPFS::%s] restored saved path-sharing chains exactly (sharedHeads=%u partialHeads=%u)",
+				__func__,
+				static_cast<unsigned int>(sharedPaths.size()),
+				static_cast<unsigned int>(partialSharedPaths.size())
+			);
+		}
+
+		return (restoredSharedChains || restoredPartialSharedChains);
+	};
+
+	const bool restoredSavedPathChains = tryRestoreSavedPathChains();
+
+	if (!restoredSavedPathChains) {
+		sharedPaths.clear();
+		partialSharedPaths.clear();
+
+		std::vector<QTPFS::entity> sharedChainEntities;
+		registry.view<SharedPathChain>().each([&sharedChainEntities](QTPFS::entity entity, SharedPathChain&) {
+			sharedChainEntities.emplace_back(entity);
+		});
+		for (const QTPFS::entity entity: sharedChainEntities) {
+			if (registry.valid(entity) && registry.all_of<SharedPathChain>(entity))
+				registry.remove<SharedPathChain>(entity);
+		}
+
+		std::vector<QTPFS::entity> partialSharedChainEntities;
+		registry.view<PartialSharedPathChain>().each([&partialSharedChainEntities](QTPFS::entity entity, PartialSharedPathChain&) {
+			partialSharedChainEntities.emplace_back(entity);
+		});
+		for (const QTPFS::entity entity: partialSharedChainEntities) {
+			if (registry.valid(entity) && registry.all_of<PartialSharedPathChain>(entity))
+				registry.remove<PartialSharedPathChain>(entity);
+		}
+
+		spring::unordered_map<PathHashType, std::vector<QTPFS::entity>> sharedPathGroups;
+		spring::unordered_map<PathHashType, std::vector<QTPFS::entity>> partialSharedPathGroups;
+
+		for (const QTPFS::entity entity : restoredPaths) {
+			IPath* path = registry.try_get<IPath>(entity);
+			if (path == nullptr)
+				continue;
+			if (path->GetOwner() == nullptr)
+				continue;
+			if (registry.any_of<PathSearchRef, PathIsTemp>(entity))
+				continue;
+
+			if (path->GetHash() != BAD_HASH) {
+				sharedPathGroups[path->GetHash()].emplace_back(entity);
+			}
+			if (path->GetVirtualHash() != BAD_HASH) {
+				partialSharedPathGroups[path->GetVirtualHash()].emplace_back(entity);
+			}
+		}
+
+		for (auto& [hash, entities] : sharedPathGroups) {
+			if (entities.empty())
+				continue;
+
+			for (size_t idx = 0; idx < entities.size(); ++idx) {
+				const QTPFS::entity entity = entities[idx];
+				const QTPFS::entity prev = entities[(idx + entities.size() - 1) % entities.size()];
+				const QTPFS::entity next = entities[(idx + 1) % entities.size()];
+				registry.emplace<SharedPathChain>(entity, prev, next);
+			}
+
+			sharedPaths[hash] = entities.front();
+		}
+
+		for (auto& [hash, entities] : partialSharedPathGroups) {
+			if (entities.empty())
+				continue;
+
+			for (size_t idx = 0; idx < entities.size(); ++idx) {
+				const QTPFS::entity entity = entities[idx];
+				const QTPFS::entity prev = entities[(idx + entities.size() - 1) % entities.size()];
+				const QTPFS::entity next = entities[(idx + 1) % entities.size()];
+				registry.emplace<PartialSharedPathChain>(entity, prev, next);
+			}
+
+			partialSharedPaths[hash] = entities.front();
+		}
+	}
+
+	pendingLoadSaveState = LoadSaveState{};
+	pendingLoadSaveRestore = false;
 }

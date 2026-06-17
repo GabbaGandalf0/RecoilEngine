@@ -37,6 +37,10 @@ CR_REG_METADATA(CGameSetup, (
 	CR_IGNORED(onlyLocal),
 	CR_IGNORED(hostDemo),
 	CR_IGNORED(recordDemo),
+	CR_IGNORED(replayCheckpoint),
+	CR_IGNORED(replayCheckpointSchema),
+	CR_IGNORED(replayDemoStartFrame),
+	CR_IGNORED(replayDemoStartTime),
 
 	CR_IGNORED(dsMapHash),
 	CR_IGNORED(dsModHash),
@@ -190,6 +194,11 @@ void CGameSetup::ResetState()
 	onlyLocal = false;
 	hostDemo = false;
 	recordDemo = true;
+
+	replayCheckpoint = false;
+	replayCheckpointSchema = 0;
+	replayDemoStartFrame = -1;
+	replayDemoStartTime = -1.0f;
 
 	std::memset(dsMapHash, 0, sizeof(dsMapHash));
 	std::memset(dsModHash, 0, sizeof(dsModHash));
@@ -566,13 +575,10 @@ bool CGameSetup::Init(const std::string& buf)
 	if (!file.SectionExist("GAME"))
 		return false;
 
-	#ifdef DEDICATED
 	{
-		// read script-provided hashes for dedicated server
+		// read script-provided replay hashes for save-load and demo-based reloads
 		const std::string mapHashHexStr = file.SGetValueDef("",  "GAME\\MapHash");
 		const std::string modHashHexStr = file.SGetValueDef("",  "GAME\\ModHash");
-
-		LOG_L(L_INFO, "[GameSetup::%s]\n\tmapHashHexStr=\"%s\"\n\tmodHashHexStr=\"%s\"", __func__, mapHashHexStr.c_str(), modHashHexStr.c_str());
 
 		sha512::hex_digest mapHashHex;
 		sha512::hex_digest modHashHex;
@@ -591,13 +597,13 @@ bool CGameSetup::Init(const std::string& buf)
 
 		if (mapHashHexStr.size() == (sha512::SHA_LEN * 2)) {
 			std::copy(mapHashHexStr.begin(), mapHashHexStr.end(), mapHashHex.data());
-		} else {
+		} else if (!mapHashHexStr.empty() && mapHashHexStr.size() != 1) {
 			LOG_L(L_WARNING, "[GameSetup::%s] DS map-hash string \"%s\" should contain %u characters", __func__, mapHashHexStr.c_str(), sha512::SHA_LEN * 2);
 		}
 
 		if (modHashHexStr.size() == (sha512::SHA_LEN * 2)) {
 			std::copy(modHashHexStr.begin(), modHashHexStr.end(), modHashHex.data());
-		} else {
+		} else if (!modHashHexStr.empty() && modHashHexStr.size() != 1) {
 			LOG_L(L_WARNING, "[GameSetup::%s] DS mod-hash string \"%s\" should contain %u characters", __func__, modHashHexStr.c_str(), sha512::SHA_LEN * 2);
 		}
 
@@ -606,7 +612,6 @@ bool CGameSetup::Init(const std::string& buf)
 		std::memcpy(dsMapHash, mapHashRaw.data(), sizeof(dsMapHash));
 		std::memcpy(dsModHash, modHashRaw.data(), sizeof(dsModHash));
 	}
-	#endif
 
 	/* Don't be afraid to reuse MapSeed for something sensible if you're
 	 * implementing a proper random map generator. It's just used here
@@ -622,6 +627,11 @@ bool CGameSetup::Init(const std::string& buf)
 	mapName     = file.SGetValueDef("",  "GAME\\MapName");
 	demoName    = file.SGetValueDef("",  "GAME\\Demofile");
 	hostDemo    = !demoName.empty();
+
+	file.GetTDef(replayCheckpoint,       false, "GAME\\ReplayCheckpoint");
+	file.GetTDef(replayCheckpointSchema, 0u,    "GAME\\ReplayCheckpointSchema");
+	file.GetTDef(replayDemoStartFrame,   -1,    "GAME\\ReplayDemoStartFrame");
+	file.GetTDef(replayDemoStartTime,    -1.0f, "GAME\\ReplayDemoStartTime");
 
 	file.GetTDef(gameStartDelay, 4u, "GAME\\GameStartDelay");
 
@@ -678,4 +688,3 @@ std::string CGameSetup::MapFileName() const
 {
 	return (archiveScanner->MapNameToMapFile(mapName));
 }
-

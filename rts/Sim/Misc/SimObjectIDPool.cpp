@@ -9,12 +9,20 @@
 
 #include "System/Misc/TracyDefs.h"
 
+#include <algorithm>
+#include <numeric>
+#include <vector>
+
 
 CR_BIND(SimObjectIDPool, )
 CR_REG_METADATA(SimObjectIDPool, (
 	CR_MEMBER(poolIDs),
 	CR_MEMBER(freeIDs),
-	CR_MEMBER(tempIDs)
+	CR_MEMBER(tempIDs),
+	CR_MEMBER(freeIDOrder),
+	CR_MEMBER(tempIDOrder),
+	CR_MEMBER(freeIDOrderCursor),
+	CR_POSTLOAD(PostLoad)
 ))
 
 
@@ -44,6 +52,48 @@ void SimObjectIDPool::Expand(uint32_t baseID, uint32_t numIDs) {
 		freeIDs.emplace(baseID + offsetID, newIDs[offsetID]);
 		poolIDs.emplace(newIDs[offsetID], baseID + offsetID);
 	}
+
+	RefreshFreeIDOrder();
+}
+
+void SimObjectIDPool::RefreshFreeIDOrder()
+{
+	RECOIL_DETAILED_TRACY_ZONE;
+	freeIDOrder.clear();
+	freeIDOrder.reserve(freeIDs.size());
+
+	for (const auto& entry: freeIDs) {
+		freeIDOrder.emplace_back(entry.second);
+	}
+
+	freeIDOrderCursor = 0;
+}
+
+void SimObjectIDPool::RefreshTempIDOrder()
+{
+	RECOIL_DETAILED_TRACY_ZONE;
+	tempIDOrder.clear();
+	tempIDOrder.reserve(tempIDs.size());
+
+	for (const auto& entry: tempIDs) {
+		tempIDOrder.emplace_back(entry.second);
+	}
+}
+
+void SimObjectIDPool::PostLoad()
+{
+	RECOIL_DETAILED_TRACY_ZONE;
+
+	// Older checkpoint files do not contain explicit extraction orders.
+	// New checkpoints keep the serialized UID order so newly created objects
+	// receive the same IDs after loading a rewind checkpoint.
+	if (freeIDOrder.empty() && !freeIDs.empty())
+		RefreshFreeIDOrder();
+	if (tempIDOrder.empty() && !tempIDs.empty())
+		RefreshTempIDOrder();
+
+	if (freeIDOrderCursor > freeIDOrder.size())
+		freeIDOrderCursor = 0;
 }
 
 
@@ -65,13 +115,48 @@ uint32_t SimObjectIDPool::ExtractID() {
 	// and FeatureHandler have safeguards
 	assert(!IsEmpty());
 
-	const auto it = freeIDs.begin();
-	const uint32_t uid = it->second;
+	if (freeIDOrderCursor >= freeIDOrder.size())
+		RefreshFreeIDOrder();
+
+	auto it = freeIDs.end();
+	uint32_t uid = 0;
+	while (freeIDOrderCursor < freeIDOrder.size()) {
+		uid = freeIDOrder[freeIDOrderCursor++];
+		const auto poolIt = poolIDs.find(uid);
+
+		if (poolIt == poolIDs.end())
+			continue;
+
+		it = freeIDs.find(poolIt->second);
+		if (it != freeIDs.end())
+			break;
+	}
+
+	if (it == freeIDs.end()) {
+		RefreshFreeIDOrder();
+		assert(!freeIDOrder.empty());
+
+		while (freeIDOrderCursor < freeIDOrder.size()) {
+			uid = freeIDOrder[freeIDOrderCursor++];
+			const auto poolIt = poolIDs.find(uid);
+
+			if (poolIt == poolIDs.end())
+				continue;
+
+			it = freeIDs.find(poolIt->second);
+			if (it != freeIDs.end())
+				break;
+		}
+	}
+
+	assert(it != freeIDs.end());
+	assert(it->second == uid);
 
 	freeIDs.erase(it);
 
-	if (IsEmpty())
+	if (IsEmpty()) {
 		RecycleIDs();
+	}
 
 	return uid;
 }
@@ -87,10 +172,8 @@ void SimObjectIDPool::ReserveID(uint32_t uid) {
 
 	freeIDs.erase(idx);
 
-	if (!IsEmpty())
-		return;
-
-	RecycleIDs();
+	if (IsEmpty())
+		RecycleIDs();
 }
 
 void SimObjectIDPool::FreeID(uint32_t uid, bool delayed) {
@@ -101,10 +184,14 @@ void SimObjectIDPool::FreeID(uint32_t uid, bool delayed) {
 	// to the maximum)
 	assert(!HasID(uid));
 
+	const uint32_t idx = poolIDs[uid];
+
 	if (delayed) {
-		tempIDs.emplace(poolIDs[uid], uid);
+		tempIDs.emplace(idx, uid);
+		tempIDOrder.emplace_back(uid);
 	} else {
-		freeIDs.emplace(poolIDs[uid], uid);
+		freeIDs.emplace(idx, uid);
+		freeIDOrder.emplace_back(uid);
 	}
 
 	//handle the corner case of maximum allocation
@@ -124,14 +211,38 @@ bool SimObjectIDPool::RecycleID(uint32_t uid) {
 
 	tempIDs.erase(idx);
 	freeIDs.emplace(idx, uid);
+	tempIDOrder.erase(std::remove(tempIDOrder.begin(), tempIDOrder.end(), uid), tempIDOrder.end());
+	freeIDOrder.emplace_back(uid);
+
 	return true;
 }
 
 void SimObjectIDPool::RecycleIDs() {
 	RECOIL_DETAILED_TRACY_ZONE;
+
+	freeIDOrder.clear();
+	freeIDOrderCursor = 0;
+
 	// throw each ID recycled up until now back into the pool
-	freeIDs.insert(tempIDs.begin(), tempIDs.end());
+	for (const uint32_t uid: tempIDOrder) {
+		const auto poolIt = poolIDs.find(uid);
+
+		if (poolIt == poolIDs.end())
+			continue;
+
+		const auto it = tempIDs.find(poolIt->second);
+		if (it != tempIDs.end()) {
+			freeIDs.emplace(it->first, it->second);
+			freeIDOrder.emplace_back(it->second);
+		}
+	}
+	for (const auto& [idx, uid]: tempIDs) {
+		const auto inserted = freeIDs.emplace(idx, uid);
+		if (inserted.second)
+			freeIDOrder.emplace_back(uid);
+	}
 	tempIDs.clear();
+	tempIDOrder.clear();
 }
 
 
@@ -146,3 +257,45 @@ bool SimObjectIDPool::HasID(uint32_t uid) const {
 	return (freeIDs.find(idx) != freeIDs.end());
 }
 
+uint64_t SimObjectIDPool::GetDebugDigest() const
+{
+	RECOIL_DETAILED_TRACY_ZONE;
+
+	uint64_t digest = 1469598103934665603ull;
+	const auto mix = [&digest](const uint64_t value) {
+		digest ^= value;
+		digest *= 1099511628211ull;
+	};
+	const auto mixMap = [&mix](const IDMap& map) {
+		std::vector<std::pair<uint32_t, uint32_t>> entries;
+		entries.reserve(map.size());
+
+		for (const auto& entry: map) {
+			entries.emplace_back(entry.first, entry.second);
+		}
+
+		std::sort(entries.begin(), entries.end());
+		mix(entries.size());
+
+		for (const auto& [key, value]: entries) {
+			mix(key);
+			mix(value);
+		}
+	};
+	const auto mixVector = [&mix](const std::vector<uint32_t>& values) {
+		mix(values.size());
+
+		for (const uint32_t value: values) {
+			mix(value);
+		}
+	};
+
+	mixMap(poolIDs);
+	mixMap(freeIDs);
+	mixMap(tempIDs);
+	mixVector(freeIDOrder);
+	mixVector(tempIDOrder);
+	mix(freeIDOrderCursor);
+
+	return digest;
+}

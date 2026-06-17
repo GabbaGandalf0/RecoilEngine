@@ -14,6 +14,8 @@
 #include "System/SpringMath.h"
 #include "System/TimeProfiler.h"
 #include "System/Threading/ThreadPool.h"
+#include "System/creg/ISerializer.h"
+#include "System/creg/creg_cond.h"
 
 #include "System/Misc/TracyDefs.h"
 
@@ -33,6 +35,92 @@ using namespace SmoothHeightMeshNamespace;
 #endif
 
 SmoothHeightMesh smoothGround;
+
+#ifdef USING_CREG
+CR_BIND(SmoothHeightMesh, )
+CR_REG_METADATA(SmoothHeightMesh, (
+	CR_SERIALIZER(Serialize),
+	CR_POSTLOAD(PostLoad)
+))
+#endif
+
+template<typename T>
+static void SerializeVectorRaw(creg::ISerializer* s, std::vector<T>& values)
+{
+	int size = int(values.size());
+	s->SerializeInt(&size, sizeof(size));
+
+	if (!s->IsWriting())
+		values.resize(size);
+
+	if (size > 0)
+		s->Serialize(values.data(), size * int(sizeof(T)));
+}
+
+static void SerializeVectorBool(creg::ISerializer* s, std::vector<bool>& values)
+{
+	int size = int(values.size());
+	s->SerializeInt(&size, sizeof(size));
+
+	if (s->IsWriting()) {
+		for (int i = 0; i < size; ++i) {
+			bool value = values[i];
+			s->Serialize(&value, sizeof(value));
+		}
+
+		return;
+	}
+
+	values.clear();
+	values.resize(size);
+
+	for (int i = 0; i < size; ++i) {
+		bool value = false;
+		s->Serialize(&value, sizeof(value));
+		values[i] = value;
+	}
+}
+
+static void SerializeQueue(creg::ISerializer* s, std::queue<int>& queue)
+{
+	int size = int(queue.size());
+	s->SerializeInt(&size, sizeof(size));
+
+	if (s->IsWriting()) {
+		std::queue<int> copy = queue;
+
+		while (!copy.empty()) {
+			int value = copy.front();
+			copy.pop();
+			s->SerializeInt(&value, sizeof(value));
+		}
+
+		return;
+	}
+
+	while (!queue.empty())
+		queue.pop();
+
+	for (int i = 0; i < size; ++i) {
+		int value = 0;
+		s->SerializeInt(&value, sizeof(value));
+		queue.push(value);
+	}
+}
+
+static void SerializeMapChangeTrack(creg::ISerializer* s, SmoothHeightMesh::MapChangeTrack& track)
+{
+	SerializeVectorBool(s, track.damageMap);
+	SerializeQueue(s, track.damageQueue[0]);
+	SerializeQueue(s, track.damageQueue[1]);
+	SerializeQueue(s, track.horizontalBlurQueue);
+	SerializeQueue(s, track.verticalBlurQueue);
+
+	s->SerializeInt(&track.width, sizeof(track.width));
+	s->SerializeInt(&track.height, sizeof(track.height));
+	s->SerializeInt(&track.queueReleaseOnFrame, sizeof(track.queueReleaseOnFrame));
+	s->Serialize(&track.activeBuffer, sizeof(track.activeBuffer));
+}
 
 
 static float Interpolate(float x, float y, const int maxx, const int maxy, const float res, const float* heightmap)
@@ -119,6 +207,85 @@ void SmoothHeightMesh::Kill() {
 	maximaMesh.clear();
 	mesh.clear();
 	origMesh.clear();
+}
+
+SmoothHeightMesh::SerializedState SmoothHeightMesh::CaptureSerializedState() const
+{
+	SerializedState state;
+
+	state.enabled = enabled;
+	state.maxx = maxx;
+	state.maxy = maxy;
+	state.fmaxx = fmaxx;
+	state.fmaxy = fmaxy;
+	state.fresolution = fresolution;
+	state.resolution = resolution;
+	state.smoothRadius = smoothRadius;
+
+	state.maximaMesh = maximaMesh;
+	state.mesh = mesh;
+	state.tempMesh = tempMesh;
+	state.origMesh = origMesh;
+	state.colsMaxima = colsMaxima;
+	state.maximaRows = maximaRows;
+	state.mapChangeTrack = mapChangeTrack;
+
+	return state;
+}
+
+void SmoothHeightMesh::ApplySerializedState(const SerializedState& state)
+{
+	enabled = state.enabled;
+	maxx = state.maxx;
+	maxy = state.maxy;
+	fmaxx = state.fmaxx;
+	fmaxy = state.fmaxy;
+	fresolution = state.fresolution;
+	resolution = state.resolution;
+	smoothRadius = state.smoothRadius;
+
+	maximaMesh = state.maximaMesh;
+	mesh = state.mesh;
+	tempMesh = state.tempMesh;
+	origMesh = state.origMesh;
+	colsMaxima = state.colsMaxima;
+	maximaRows = state.maximaRows;
+	mapChangeTrack = state.mapChangeTrack;
+}
+
+void SmoothHeightMesh::Serialize(creg::ISerializer* s)
+{
+	s->Serialize(&enabled, sizeof(enabled));
+	s->SerializeInt(&maxx, sizeof(maxx));
+	s->SerializeInt(&maxy, sizeof(maxy));
+	s->Serialize(&fmaxx, sizeof(fmaxx));
+	s->Serialize(&fmaxy, sizeof(fmaxy));
+	s->Serialize(&fresolution, sizeof(fresolution));
+	s->SerializeInt(&resolution, sizeof(resolution));
+	s->SerializeInt(&smoothRadius, sizeof(smoothRadius));
+
+	SerializeVectorRaw(s, maximaMesh);
+	SerializeVectorRaw(s, mesh);
+	SerializeVectorRaw(s, tempMesh);
+	SerializeVectorRaw(s, origMesh);
+	SerializeVectorRaw(s, colsMaxima);
+	SerializeVectorRaw(s, maximaRows);
+	SerializeMapChangeTrack(s, mapChangeTrack);
+
+	if (!s->IsWriting()) {
+		pendingPostLoadRestore = CaptureSerializedState();
+		hasPendingPostLoadRestore = true;
+	}
+}
+
+void SmoothHeightMesh::PostLoad()
+{
+	if (!hasPendingPostLoadRestore)
+		return;
+
+	ApplySerializedState(pendingPostLoadRestore);
+	hasPendingPostLoadRestore = false;
+	pendingPostLoadRestore = {};
 }
 
 float SmoothHeightMesh::GetHeight(float x, float y)

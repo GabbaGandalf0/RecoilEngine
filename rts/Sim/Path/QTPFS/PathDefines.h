@@ -71,6 +71,9 @@ namespace QTPFS {
         bool operator<(const PathHashType& other) const {
 			return (high < other.high) ? true : ((high == other.high) ? (low < other.low) : false);
 		}
+
+		uint64_t GetLow() const { return low; }
+		uint64_t GetHigh() const { return high; }
 	};
 
     constexpr uint64_t BAD_HASH_PART = std::numeric_limits<std::uint64_t>::max();
@@ -78,4 +81,3 @@ namespace QTPFS {
 }
 
 #endif
-

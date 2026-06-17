@@ -215,8 +215,12 @@ void CExplosionGeneratorHandler::ParseExplosionTables()
 	spring::SafeDestruct(aliasParser);
 	spring::SafeDestruct(explTblRoot);
 
-	exploParser = new (exploParserMem) LuaParser("gamedata/explosions.lua", SPRING_VFS_MOD_BASE, SPRING_VFS_ZIP);
-	aliasParser = new (aliasParserMem) LuaParser("gamedata/explosion_alias.lua", SPRING_VFS_MOD_BASE, SPRING_VFS_ZIP);
+	// Allow standalone raw-file hotfixes for broken explosion definitions while
+	// still falling back to the packaged game content. The access mode must also
+	// prefer raw files, otherwise gamedata/explosions.lua would still include the
+	// packaged effects/*.lua files and bypass standalone overrides.
+	exploParser = new (exploParserMem) LuaParser("gamedata/explosions.lua", SPRING_VFS_RAW_FIRST, SPRING_VFS_RAW_FIRST);
+	aliasParser = new (aliasParserMem) LuaParser("gamedata/explosion_alias.lua", SPRING_VFS_RAW_FIRST, SPRING_VFS_RAW_FIRST);
 	explTblRoot = nullptr;
 
 	if (!aliasParser->Execute()) {
@@ -1175,4 +1179,3 @@ bool CCustomExplosionGenerator::OutputProjectileClassInfo()
 	return false;
 #endif
 }
-

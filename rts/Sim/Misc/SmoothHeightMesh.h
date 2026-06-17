@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "Sim/Misc/GlobalConstants.h"
+#include "System/creg/creg_cond.h"
 #include "System/type2.h"
 
 class CGround;
@@ -23,6 +24,7 @@ namespace SmoothHeightMeshNamespace {
 class SmoothHeightMesh
 {
 	friend class SmoothHeightMeshDrawer;
+	CR_DECLARE_STRUCT(SmoothHeightMesh)
 
 public:
 
@@ -61,10 +63,37 @@ public:
 
 	void MakeSmoothMesh();
 
+	void Serialize(creg::ISerializer* s);
+	void PostLoad();
+
 private:
+	struct SerializedState {
+		bool enabled = true;
+
+		int maxx = 0;
+		int maxy = 0;
+		float fmaxx = 0.0f;
+		float fmaxy = 0.0f;
+		float fresolution = 0.0f;
+		int resolution = 0;
+		int smoothRadius = 0;
+
+		std::vector<float> maximaMesh;
+		std::vector<float> mesh;
+		std::vector<float> tempMesh;
+		std::vector<float> origMesh;
+
+		std::vector<float> colsMaxima;
+		std::vector<int> maximaRows;
+
+		MapChangeTrack mapChangeTrack;
+	};
+
 	void InitMapChangeTracking();
 	void InitDataStructures();
 	void UpdateSmoothMeshMaximas(int2 damageMin, int2 damageMax);
+	SerializedState CaptureSerializedState() const;
+	void ApplySerializedState(const SerializedState& state);
 
 	bool enabled = true;
 
@@ -85,6 +114,9 @@ private:
 	std::vector<int> maximaRows;
 
 	MapChangeTrack mapChangeTrack;
+
+	SerializedState pendingPostLoadRestore;
+	bool hasPendingPostLoadRestore = false;
 };
 
 extern SmoothHeightMesh smoothGround;

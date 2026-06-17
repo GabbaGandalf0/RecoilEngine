@@ -16,6 +16,7 @@
 #include "System/CompactVector.h"
 #include "System/float3.h"
 #include "System/Rectangle.h"
+#include "System/creg/creg_cond.h"
 
 #ifndef QTPFS_VIRTUAL_NODE_FUNCTIONS
 #define QTNode INode
@@ -27,6 +28,36 @@ namespace QTPFS {
 	struct NodeLayer;
 	struct SearchNode;
 	struct UpdateThreadData;
+
+	struct LoadSaveNetPoint {
+		CR_DECLARE_STRUCT(LoadSaveNetPoint)
+
+		float x = 0.0f;
+		float y = 0.0f;
+	};
+
+	struct LoadSaveNodeNeighbour {
+		CR_DECLARE_STRUCT(LoadSaveNodeNeighbour)
+
+		int nodeId = -1;
+		std::vector<LoadSaveNetPoint> netPoints;
+	};
+
+	struct LoadSaveQTNodeState {
+		CR_DECLARE_STRUCT(LoadSaveQTNodeState)
+
+		bool active = false;
+		unsigned int poolIndex = 0;
+		unsigned int nodeNumber = -1u;
+		unsigned int rawIndex = 0;
+		unsigned int childBaseIndex = -1u;
+		unsigned short xmin = 0;
+		unsigned short xmax = 0;
+		unsigned short zmin = 0;
+		unsigned short zmax = 0;
+		float moveCostAvg = -1.0f;
+		std::vector<LoadSaveNodeNeighbour> neighbours;
+	};
 
 	struct INode {
 			friend SearchNode;
@@ -86,6 +117,9 @@ namespace QTPFS {
 		void PreTesselate(NodeLayer& nl, const SRectangle& r, SRectangle& ur, unsigned int depth, const UpdateThreadData* threadData);
 		void Tesselate(NodeLayer& nl, const SRectangle& r, unsigned int depth, const UpdateThreadData* threadData);
 		void Serialize(nowide::fstream& fStream, NodeLayer& nodeLayer, unsigned int* streamSize, unsigned int depth, bool readMode);
+		void CaptureLoadSaveState(LoadSaveQTNodeState& outState) const;
+		void RestoreLoadSaveState(const LoadSaveQTNodeState& inState);
+		bool SanitizeLoadSaveState(const NodeLayer& nodeLayer, unsigned int maxNodesAlloced);
 
 		bool IsLeaf() const { return (childBaseIndex == -1u); }
 		bool CanSplit(unsigned int depth, bool forced) const;
@@ -299,4 +333,3 @@ namespace QTPFS {
 }
 
 #endif
-

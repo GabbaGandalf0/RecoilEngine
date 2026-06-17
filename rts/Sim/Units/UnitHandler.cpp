@@ -512,4 +512,3 @@ unsigned int CUnitHandler::CalcMaxUnits() const
 
 	return n;
 }
-

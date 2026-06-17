@@ -48,6 +48,23 @@ LOG_REGISTER_SECTION_GLOBAL(LOG_SECTION_NET)
 
 static spring::unordered_map<int32_t, uint32_t> localSyncChecksums;
 
+namespace netcode {
+	void RestoreLocalSyncChecksum(int32_t frameNum, uint32_t checksum)
+	{
+		// Keep the first uninterrupted replay checksum when it is available.
+		// A direct checkpoint load seeds the frame only when no baseline exists.
+		if (localSyncChecksums.find(frameNum) == localSyncChecksums.end())
+			localSyncChecksums.emplace(frameNum, checksum);
+	}
+}
+
+namespace {
+	static bool IsReplayCheckpointSession()
+	{
+		return (gameSetup != nullptr && gameSetup->replayCheckpoint);
+	}
+}
+
 
 void CGame::AddTraffic(int playerID, int packetCode, int length)
 {
@@ -624,8 +641,8 @@ void CGame::ClientReadNet()
 				clientNet->Send(CBaseNetProtocol::Get().SendSyncResponse(gu->myPlayerNum, gs->frameNum, CSyncChecker::GetChecksum()));
 
 				// buffer all checksums, so we can check sync later between demo & local
-				if (haveServerDemo)
-					localSyncChecksums[gs->frameNum] = CSyncChecker::GetChecksum();
+				if (haveServerDemo && localSyncChecksums.find(gs->frameNum) == localSyncChecksums.end())
+					localSyncChecksums.emplace(gs->frameNum, CSyncChecker::GetChecksum());
 
 				// reset checksum every 4096 frames =~ 2.5 minutes
 				if ((gs->frameNum & 4095) == 0)
@@ -722,22 +739,29 @@ void CGame::ClientReadNet()
 
 					const CPlayer* netPlayer = playerHandler.Player(playerNum);
 					const CUnit* unit = nullptr;
+					const bool trustReplayCheckpointSelection = IsReplayCheckpointSession();
 
 					selectedUnitIDs.reserve(numUnitIDs);
 
 					for (uint32_t a = 0; a < numUnitIDs; ++a) {
 						int16_t unitID; pckt >> unitID;
+						const int rawUnitID = unitID;
 
 						// unit was destroyed in simulation (without its ID being recycled)
 						// after sending a command but before receiving it back, more likely
 						// to happen in high-latency situations
 						// LOG_L(L_WARNING, "[NETMSG_SELECT] invalid unitID (%i) from player %i", unitID, playerNum);
-						if ((unit = unitHandler.GetUnit(unitID)) == nullptr)
+						if ((unit = unitHandler.GetUnit(rawUnitID)) == nullptr) {
 							continue;
+						}
 
-						// if in (full) godMode, this is always true for any player
-						if (netPlayer->CanControlTeam(unit->team))
-							selectedUnitIDs.push_back(unitID);
+						// Rewind checkpoints resume an already-recorded demo stream. The
+						// original server accepted these selections before writing the demo,
+						// so replaying from a checkpoint must not drop them because of a
+						// locally reconstructed permission cache.
+						if (trustReplayCheckpointSelection || netPlayer->CanControlTeam(unit->team)) {
+							selectedUnitIDs.push_back(rawUnitID);
+						}
 					}
 
 					selectedUnitsHandler.NetSelect(selectedUnitIDs, playerNum);

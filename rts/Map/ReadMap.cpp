@@ -3,6 +3,7 @@
 
 #include <cstdlib>
 #include <cstring> // memcpy
+#include <set>
 
 #include "xsimd/xsimd.hpp"
 #include "ReadMap.h"
@@ -189,6 +190,7 @@ void CReadMap::Serialize(creg::ISerializer* s)
 	SerializeMapChangesBeforeMatch(s);
 	SerializeMapChangesDuringMatch(s);
 	SerializeTypeMap(s);
+	SerializePendingDerivedTerrain(s);
 	s->SerializeObjectInstance(&metalMap, metalMap.GetClass());
 }
 
@@ -259,6 +261,249 @@ void CReadMap::SerializeTypeMap(creg::ISerializer* s)
 	FreeInfoMap("type", iotm);
 }
 
+void CReadMap::SerializePendingDerivedTerrain(creg::ISerializer* s)
+{
+	RECOIL_DETAILED_TRACY_ZONE;
+
+	static constexpr int TERRAIN_TILE_SIZE = 32;
+	std::vector<SRectangle> pendingRects;
+	std::set<int> tileIds;
+
+	if (s->IsWriting()) {
+		mapDamage->GetPendingTerrainRecalcRects(pendingRects);
+
+		for (const SRectangle& rect: pendingRects) {
+			const int firstTileX = rect.x1 / TERRAIN_TILE_SIZE;
+			const int firstTileZ = rect.z1 / TERRAIN_TILE_SIZE;
+			const int lastTileX = std::max(rect.x1, rect.x2 - 1) / TERRAIN_TILE_SIZE;
+			const int lastTileZ = std::max(rect.z1, rect.z2 - 1) / TERRAIN_TILE_SIZE;
+			const int tilesX = (mapDims.mapx + TERRAIN_TILE_SIZE - 1) / TERRAIN_TILE_SIZE;
+
+			for (int tileZ = firstTileZ; tileZ <= lastTileZ; ++tileZ) {
+				for (int tileX = firstTileX; tileX <= lastTileX; ++tileX) {
+					tileIds.insert(tileZ * tilesX + tileX);
+				}
+			}
+		}
+	}
+
+	uint32_t tileCount = static_cast<uint32_t>(tileIds.size());
+	s->Serialize(tileCount);
+
+	if (s->IsWriting()) {
+		loadSaveTerrainTiles.clear();
+		loadSaveTerrainTiles.reserve(tileCount);
+
+		const int tilesX = (mapDims.mapx + TERRAIN_TILE_SIZE - 1) / TERRAIN_TILE_SIZE;
+		for (const int tileId: tileIds) {
+			LoadSaveTerrainTile tile;
+			tile.tileX = tileId % tilesX;
+			tile.tileZ = tileId / tilesX;
+			loadSaveTerrainTiles.emplace_back(std::move(tile));
+		}
+	} else {
+		loadSaveTerrainTiles.clear();
+		loadSaveTerrainTiles.resize(tileCount);
+	}
+
+	auto serializeFloatVector = [s](std::vector<float>& values, size_t valueCount) {
+		if (!s->IsWriting())
+			values.resize(valueCount);
+		if (!values.empty())
+			s->Serialize(values.data(), static_cast<int>(values.size() * sizeof(float)));
+	};
+	auto serializeFloat3Vector = [s](std::vector<float3>& values, size_t valueCount) {
+		if (!s->IsWriting())
+			values.resize(valueCount);
+		if (!values.empty())
+			s->Serialize(values.data(), static_cast<int>(values.size() * sizeof(float3)));
+	};
+
+	for (LoadSaveTerrainTile& tile: loadSaveTerrainTiles) {
+		s->Serialize(tile.tileX);
+		s->Serialize(tile.tileZ);
+
+		const int x1 = tile.tileX * TERRAIN_TILE_SIZE;
+		const int z1 = tile.tileZ * TERRAIN_TILE_SIZE;
+		const int x2 = std::min(x1 + TERRAIN_TILE_SIZE, mapDims.mapx);
+		const int z2 = std::min(z1 + TERRAIN_TILE_SIZE, mapDims.mapy);
+		const size_t squareCount = static_cast<size_t>(x2 - x1) * (z2 - z1);
+		const int slopeX1 = x1 / 2;
+		const int slopeZ1 = z1 / 2;
+		const int slopeX2 = std::min((x2 + 1) / 2, mapDims.hmapx);
+		const int slopeZ2 = std::min((z2 + 1) / 2, mapDims.hmapy);
+		const size_t slopeCount = static_cast<size_t>(slopeX2 - slopeX1) * (slopeZ2 - slopeZ1);
+
+		if (s->IsWriting()) {
+			tile.centerHeights.clear();
+			tile.maxHeights.clear();
+			tile.faceNormals.clear();
+			tile.centerNormals.clear();
+			tile.centerNormals2DValues.clear();
+			tile.slopes.clear();
+
+			tile.centerHeights.reserve(squareCount);
+			tile.maxHeights.reserve(squareCount);
+			tile.faceNormals.reserve(squareCount * 2);
+			tile.centerNormals.reserve(squareCount);
+			tile.centerNormals2DValues.reserve(squareCount);
+			tile.slopes.reserve(slopeCount);
+
+			for (int z = z1; z < z2; ++z) {
+				for (int x = x1; x < x2; ++x) {
+					const size_t squareIndex = static_cast<size_t>(z) * mapDims.mapx + x;
+					tile.centerHeights.push_back(centerHeightMap[squareIndex]);
+					tile.maxHeights.push_back(maxHeightMap[squareIndex]);
+					tile.faceNormals.push_back(faceNormalsSynced[squareIndex * 2]);
+					tile.faceNormals.push_back(faceNormalsSynced[squareIndex * 2 + 1]);
+					tile.centerNormals.push_back(centerNormalsSynced[squareIndex]);
+					tile.centerNormals2DValues.push_back(centerNormals2D[squareIndex]);
+				}
+			}
+
+			for (int z = slopeZ1; z < slopeZ2; ++z) {
+				for (int x = slopeX1; x < slopeX2; ++x) {
+					tile.slopes.push_back(slopeMap[static_cast<size_t>(z) * mapDims.hmapx + x]);
+				}
+			}
+		}
+
+		serializeFloatVector(tile.centerHeights, squareCount);
+		serializeFloatVector(tile.maxHeights, squareCount);
+		serializeFloat3Vector(tile.faceNormals, squareCount * 2);
+		serializeFloat3Vector(tile.centerNormals, squareCount);
+		serializeFloat3Vector(tile.centerNormals2DValues, squareCount);
+		serializeFloatVector(tile.slopes, slopeCount);
+	}
+
+	if (s->IsWriting()) {
+		loadSaveCenterHeightMap = centerHeightMap;
+		loadSaveMaxHeightMap = maxHeightMap;
+		loadSaveFaceNormalsSynced = faceNormalsSynced;
+		loadSaveCenterNormalsSynced = centerNormalsSynced;
+		loadSaveCenterNormals2D = centerNormals2D;
+		loadSaveSlopeMap = slopeMap;
+	}
+
+	serializeFloatVector(loadSaveCenterHeightMap, centerHeightMap.size());
+	serializeFloatVector(loadSaveMaxHeightMap, maxHeightMap.size());
+	serializeFloat3Vector(loadSaveFaceNormalsSynced, faceNormalsSynced.size());
+	serializeFloat3Vector(loadSaveCenterNormalsSynced, centerNormalsSynced.size());
+	serializeFloat3Vector(loadSaveCenterNormals2D, centerNormals2D.size());
+	serializeFloatVector(loadSaveSlopeMap, slopeMap.size());
+
+	for (int mip = 1; mip < numHeightMipMaps; ++mip) {
+		const size_t mipSize = static_cast<size_t>(mapDims.mapx >> mip) * (mapDims.mapy >> mip);
+
+		if (s->IsWriting())
+			loadSaveMipCenterHeightMaps[mip - 1] = mipCenterHeightMaps[mip - 1];
+
+		serializeFloatVector(loadSaveMipCenterHeightMaps[mip - 1], mipSize);
+	}
+
+	LOG("[ReplayRewind] %s exact derived terrain: rects=%u tiles=%u center=%u normals=%u slopes=%u",
+		s->IsWriting() ? "captured" : "restored",
+		static_cast<unsigned int>(pendingRects.size()),
+		tileCount,
+		static_cast<unsigned int>(loadSaveCenterHeightMap.size()),
+		static_cast<unsigned int>(loadSaveCenterNormalsSynced.size()),
+		static_cast<unsigned int>(loadSaveSlopeMap.size())
+	);
+
+	if (s->IsWriting()) {
+		std::vector<LoadSaveTerrainTile>().swap(loadSaveTerrainTiles);
+		std::vector<float>().swap(loadSaveCenterHeightMap);
+		std::vector<float>().swap(loadSaveMaxHeightMap);
+		std::vector<float3>().swap(loadSaveFaceNormalsSynced);
+		std::vector<float3>().swap(loadSaveCenterNormalsSynced);
+		std::vector<float3>().swap(loadSaveCenterNormals2D);
+		std::vector<float>().swap(loadSaveSlopeMap);
+		for (std::vector<float>& mipMap: loadSaveMipCenterHeightMaps)
+			std::vector<float>().swap(mipMap);
+	}
+}
+
+void CReadMap::RestorePendingDerivedTerrain()
+{
+	static constexpr int TERRAIN_TILE_SIZE = 32;
+
+	for (const LoadSaveTerrainTile& tile: loadSaveTerrainTiles) {
+		const int x1 = tile.tileX * TERRAIN_TILE_SIZE;
+		const int z1 = tile.tileZ * TERRAIN_TILE_SIZE;
+		const int x2 = std::min(x1 + TERRAIN_TILE_SIZE, mapDims.mapx);
+		const int z2 = std::min(z1 + TERRAIN_TILE_SIZE, mapDims.mapy);
+		const int slopeX1 = x1 / 2;
+		const int slopeZ1 = z1 / 2;
+		const int slopeX2 = std::min((x2 + 1) / 2, mapDims.hmapx);
+		const int slopeZ2 = std::min((z2 + 1) / 2, mapDims.hmapy);
+		size_t squareOffset = 0;
+		size_t slopeOffset = 0;
+
+		for (int z = z1; z < z2; ++z) {
+			for (int x = x1; x < x2; ++x, ++squareOffset) {
+				const size_t squareIndex = static_cast<size_t>(z) * mapDims.mapx + x;
+				centerHeightMap[squareIndex] = tile.centerHeights[squareOffset];
+				maxHeightMap[squareIndex] = tile.maxHeights[squareOffset];
+				faceNormalsSynced[squareIndex * 2] = tile.faceNormals[squareOffset * 2];
+				faceNormalsSynced[squareIndex * 2 + 1] = tile.faceNormals[squareOffset * 2 + 1];
+				centerNormalsSynced[squareIndex] = tile.centerNormals[squareOffset];
+				centerNormals2D[squareIndex] = tile.centerNormals2DValues[squareOffset];
+			}
+		}
+
+		for (int z = slopeZ1; z < slopeZ2; ++z) {
+			for (int x = slopeX1; x < slopeX2; ++x, ++slopeOffset) {
+				slopeMap[static_cast<size_t>(z) * mapDims.hmapx + x] = tile.slopes[slopeOffset];
+			}
+		}
+	}
+
+	auto restoreExactVector = [](auto& destination, auto& source) {
+		if (source.empty())
+			return;
+		if (destination.size() != source.size())
+			throw content_error("[CReadMap::RestorePendingDerivedTerrain] incompatible derived-terrain vector size");
+
+		std::copy(source.begin(), source.end(), destination.begin());
+		source.clear();
+		source.shrink_to_fit();
+	};
+
+	// Keep the original allocations alive: LOS, pathing, and rendering systems
+	// retain pointers into these vectors after map initialization.
+	restoreExactVector(centerHeightMap, loadSaveCenterHeightMap);
+	restoreExactVector(maxHeightMap, loadSaveMaxHeightMap);
+	restoreExactVector(faceNormalsSynced, loadSaveFaceNormalsSynced);
+	restoreExactVector(centerNormalsSynced, loadSaveCenterNormalsSynced);
+	restoreExactVector(centerNormals2D, loadSaveCenterNormals2D);
+	restoreExactVector(slopeMap, loadSaveSlopeMap);
+
+	for (int mip = 1; mip < numHeightMipMaps; ++mip) {
+		restoreExactVector(mipCenterHeightMaps[mip - 1], loadSaveMipCenterHeightMaps[mip - 1]);
+	}
+
+	sharedCenterHeightMaps[0] = centerHeightMap.data();
+	sharedCenterHeightMaps[1] = centerHeightMap.data();
+	sharedFaceNormals[0] = faceNormalsUnsynced.data();
+	sharedFaceNormals[1] = faceNormalsSynced.data();
+	sharedCenterNormals[0] = centerNormalsUnsynced.data();
+	sharedCenterNormals[1] = centerNormalsSynced.data();
+	sharedSlopeMaps[0] = slopeMap.data();
+	sharedSlopeMaps[1] = slopeMap.data();
+
+	mipPointerHeightMaps[0] = centerHeightMap.data();
+	for (int mip = 1; mip < numHeightMipMaps; ++mip)
+		mipPointerHeightMaps[mip] = mipCenterHeightMaps[mip - 1].data();
+
+	LOG("[ReplayRewind] reapplied exact derived terrain after map derivation: tiles=%u center=%u normals=%u slopes=%u",
+		static_cast<unsigned int>(loadSaveTerrainTiles.size()),
+		static_cast<unsigned int>(centerHeightMap.size()),
+		static_cast<unsigned int>(centerNormalsSynced.size()),
+		static_cast<unsigned int>(slopeMap.size())
+	);
+	loadSaveTerrainTiles.clear();
+}
+
 
 void CReadMap::PostLoad()
 {
@@ -291,6 +536,7 @@ void CReadMap::PostLoad()
 	hmUpdated = true;
 
 	mapDamage->RecalcArea(0, mapDims.mapx, 0, mapDims.mapy);
+	RestorePendingDerivedTerrain();
 }
 #endif //USING_CREG
 

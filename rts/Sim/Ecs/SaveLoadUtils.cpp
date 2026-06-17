@@ -5,13 +5,19 @@
 #include "SaveLoadUtils.h"
 
 #include "cereal/archives/binary.hpp"
+#include "cereal/types/vector.hpp"
 
 #include "System/float3.h"
 #include "System/Ecs/Components/BaseComponents.h"
 #include "System/Ecs/Utils/SystemUtils.h"
 #include "System/Log/ILog.h"
+#include "Sim/Ecs/Registry.h"
 #include "Sim/Misc/Resource.h"
 #include "Sim/MoveTypes/Components/MoveTypesComponents.h"
+#include "Sim/Features/Feature.h"
+#include "Sim/Features/FeatureHandler.h"
+#include "Sim/Units/Unit.h"
+#include "Sim/Units/UnitHandler.h"
 
 
 
@@ -39,6 +45,103 @@ void serialize(Archive &ar, BasicComponentType<std::size_t> &c) { ar(c.value); }
 
 template<class Archive>
 void serialize(Archive &ar, float3 &c) { ar(c.x, c.y, c.z); }
+
+namespace MoveTypes {
+
+int GetLoadSaveUnitID(const CUnit* unit)
+{
+    return (unit != nullptr) ? unit->id : -1;
+}
+
+int GetLoadSaveFeatureID(const CFeature* feature)
+{
+    return (feature != nullptr) ? feature->id : -1;
+}
+
+static CUnit* ResolveLoadSaveUnit(const int unitId)
+{
+    return (unitId >= 0) ? unitHandler.GetUnit(unitId) : nullptr;
+}
+
+static CFeature* ResolveLoadSaveFeature(const int featureId)
+{
+    return (featureId >= 0) ? featureHandler.GetFeature(featureId) : nullptr;
+}
+
+void ResolveLoadSaveEventPointers()
+{
+    Sim::registry.view<FeatureCollisionEvents>().each([](FeatureCollisionEvents& component) {
+        for (FeatureCollisionEvent& event: component.value) {
+            event.collider = ResolveLoadSaveUnit(event.colliderId);
+            event.collidee = ResolveLoadSaveFeature(event.collideeId);
+        }
+    });
+
+    Sim::registry.view<FeatureCrushEvents>().each([](FeatureCrushEvents& component) {
+        for (FeatureCrushEvent& event: component.value) {
+            event.collider = ResolveLoadSaveUnit(event.colliderId);
+            event.collidee = ResolveLoadSaveFeature(event.collideeId);
+        }
+    });
+
+    Sim::registry.view<FeatureMoveEvents>().each([](FeatureMoveEvents& component) {
+        for (FeatureMoveEvent& event: component.value) {
+            event.collider = ResolveLoadSaveUnit(event.colliderId);
+            event.collidee = ResolveLoadSaveFeature(event.collideeId);
+        }
+    });
+
+    Sim::registry.view<UnitCollisionEvents>().each([](UnitCollisionEvents& component) {
+        for (UnitCollisionEvent& event: component.value) {
+            event.collider = ResolveLoadSaveUnit(event.colliderId);
+            event.collidee = ResolveLoadSaveUnit(event.collideeId);
+        }
+    });
+
+    Sim::registry.view<UnitCrushEvents>().each([](UnitCrushEvents& component) {
+        for (UnitCrushEvent& event: component.value) {
+            event.collider = ResolveLoadSaveUnit(event.colliderId);
+            event.collidee = ResolveLoadSaveUnit(event.collideeId);
+        }
+    });
+
+    Sim::registry.view<UnitMovedEvent>().each([](UnitMovedEvent& event) {
+        event.unit = ResolveLoadSaveUnit(event.unitId);
+    });
+}
+
+void ResetLoadSaveTransientEvents()
+{
+    Sim::registry.view<FeatureCollisionEvents>().each([](FeatureCollisionEvents& component) {
+        component.value.clear();
+    });
+
+    Sim::registry.view<FeatureCrushEvents>().each([](FeatureCrushEvents& component) {
+        component.value.clear();
+    });
+
+    Sim::registry.view<FeatureMoveEvents>().each([](FeatureMoveEvents& component) {
+        component.value.clear();
+    });
+
+    Sim::registry.view<UnitCollisionEvents>().each([](UnitCollisionEvents& component) {
+        component.value.clear();
+    });
+
+    Sim::registry.view<UnitCrushEvents>().each([](UnitCrushEvents& component) {
+        component.value.clear();
+    });
+
+    Sim::registry.view<UnitMovedEvent>().each([](UnitMovedEvent& event) {
+        event.moved = false;
+    });
+
+    // Heading events are part of the deterministic movement pipeline. Clearing
+    // them after a rewind load drops already-queued heading changes and causes
+    // immediate post-load movement divergence.
+}
+
+}
 
 
 

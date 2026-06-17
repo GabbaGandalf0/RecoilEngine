@@ -42,6 +42,7 @@ bool ILoadSaveHandler::CreateSave(
 	ls->SaveGame(saveFile);
 	LOG("[ILoadSaveHandler::%s] saved game to file \"%s\"", __func__, saveFile.c_str());
 	delete ls;
+	globalSaveFileData = {};
 	return true;
 }
 
@@ -52,4 +53,3 @@ std::string ILoadSaveHandler::FindSaveFile(const std::string& file)
 
 	return (FileSystem::EnsurePathSepAtEnd("Saves") + file);
 }
-

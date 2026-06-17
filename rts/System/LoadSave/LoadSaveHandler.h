@@ -9,7 +9,13 @@
 struct SaveFileData {
 	std::string name; // "saves/quicksave.ssf"
 	std::string args; // "-y"
+	bool replayCheckpoint = false;
+	int replayCheckpointFrame = -1;
+	float replayCheckpointTime = -1.0f;
+	unsigned int replayCheckpointSchema = 0;
 };
+
+extern SaveFileData globalSaveFileData;
 
 class ILoadSaveHandler
 {
@@ -21,6 +27,7 @@ public:
 		if (fileData.name.empty())
 			return false;
 
+		globalSaveFileData = fileData;
 		return (CreateSave(fileData.name, fileData.args));
 	}
 
@@ -57,8 +64,4 @@ public:
 	void LoadGame() override {}
 	void LoadAIData() override {}
 };
-
-
-extern SaveFileData globalSaveFileData;
-
 #endif // _LOAD_SAVE_HANDLER_H

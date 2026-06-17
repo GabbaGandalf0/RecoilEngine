@@ -83,6 +83,109 @@ void CGameHelper::Update()
 	waitingDamages[wdIdx].clear();
 }
 
+void CGameHelper::CaptureWaitingDamageState(
+	std::vector<unsigned int>& slotOffsets,
+	std::vector<int>& attackerIDs,
+	std::vector<int>& targetIDs,
+	std::vector<int>& weaponIDs,
+	std::vector<int>& projectileIDs,
+	std::vector<DamageArray>& damages,
+	std::vector<float3>& impulses
+) const {
+	size_t totalCount = 0;
+
+	slotOffsets.clear();
+	slotOffsets.reserve(waitingDamages.size() + 1);
+
+	for (const auto& slot: waitingDamages)
+		totalCount += slot.size();
+
+	attackerIDs.clear();
+	targetIDs.clear();
+	weaponIDs.clear();
+	projectileIDs.clear();
+	damages.clear();
+	impulses.clear();
+
+	attackerIDs.reserve(totalCount);
+	targetIDs.reserve(totalCount);
+	weaponIDs.reserve(totalCount);
+	projectileIDs.reserve(totalCount);
+	damages.reserve(totalCount);
+	impulses.reserve(totalCount);
+
+	for (const auto& slot: waitingDamages) {
+		slotOffsets.push_back(static_cast<unsigned int>(attackerIDs.size()));
+
+		for (const WaitingDamage& damage: slot) {
+			attackerIDs.push_back(damage.attackerID);
+			targetIDs.push_back(damage.targetID);
+			weaponIDs.push_back(damage.weaponID);
+			projectileIDs.push_back(damage.projectileID);
+			damages.push_back(damage.damage);
+			impulses.push_back(damage.impulse);
+		}
+	}
+
+	slotOffsets.push_back(static_cast<unsigned int>(attackerIDs.size()));
+}
+
+void CGameHelper::RestoreWaitingDamageState(
+	const std::vector<unsigned int>& slotOffsets,
+	const std::vector<int>& attackerIDs,
+	const std::vector<int>& targetIDs,
+	const std::vector<int>& weaponIDs,
+	const std::vector<int>& projectileIDs,
+	const std::vector<DamageArray>& damages,
+	const std::vector<float3>& impulses
+) {
+	for (auto& slot: waitingDamages)
+		slot.clear();
+
+	const size_t entryCount = attackerIDs.size();
+	const bool valid =
+		(slotOffsets.size() == waitingDamages.size() + 1) &&
+		(targetIDs.size() == entryCount) &&
+		(weaponIDs.size() == entryCount) &&
+		(projectileIDs.size() == entryCount) &&
+		(damages.size() == entryCount) &&
+		(impulses.size() == entryCount) &&
+		(slotOffsets.front() == 0) &&
+		(slotOffsets.back() == entryCount);
+
+	if (!valid) {
+		LOG_L(L_ERROR, "[GameHelper::%s] invalid waiting-damage checkpoint state", __func__);
+		return;
+	}
+
+	for (size_t slotIndex = 0; slotIndex < waitingDamages.size(); ++slotIndex) {
+		const size_t begin = slotOffsets[slotIndex];
+		const size_t end = slotOffsets[slotIndex + 1];
+
+		if (begin > end || end > entryCount) {
+			for (auto& slot: waitingDamages)
+				slot.clear();
+
+			LOG_L(L_ERROR, "[GameHelper::%s] invalid waiting-damage slot offsets", __func__);
+			return;
+		}
+
+		auto& slot = waitingDamages[slotIndex];
+		slot.reserve(std::max<size_t>(32, end - begin));
+
+		for (size_t index = begin; index < end; ++index) {
+			slot.emplace_back(
+				damages[index],
+				impulses[index],
+				attackerIDs[index],
+				targetIDs[index],
+				weaponIDs[index],
+				projectileIDs[index]
+			);
+		}
+	}
+}
+
 
 //////////////////////////////////////////////////////////////////////
 // Explosions/Damage

@@ -43,6 +43,11 @@ public:
 		hostDemo = gs.hostDemo;
 		recordDemo = gs.recordDemo;
 
+		replayCheckpoint = gs.replayCheckpoint;
+		replayCheckpointSchema = gs.replayCheckpointSchema;
+		replayDemoStartFrame = gs.replayDemoStartFrame;
+		replayDemoStartTime = gs.replayDemoStartTime;
+
 		std::copy(gs.dsMapHash, gs.dsMapHash + sizeof(dsMapHash), dsMapHash);
 		std::copy(gs.dsModHash, gs.dsModHash + sizeof(dsModHash), dsModHash);
 		fixedRNGSeed = gs.fixedRNGSeed;
@@ -192,6 +197,11 @@ public:
 	bool onlyLocal;
 	bool hostDemo;
 	bool recordDemo;
+
+	bool replayCheckpoint;
+	unsigned int replayCheckpointSchema;
+	int replayDemoStartFrame;
+	float replayDemoStartTime;
 
 	uint8_t dsMapHash[64];
 	uint8_t dsModHash[64];

@@ -14,6 +14,17 @@
 namespace netcode { class RawPacket; }
 class CFileHandler;
 
+struct DemoReaderStreamState
+{
+	bool valid = false;
+	int filePos = 0;
+	int bytesRemaining = 0;
+	float demoTimeOffset = 0.0f;
+	float nextDemoReadTime = 0.0f;
+	float chunkModGameTime = 0.0f;
+	unsigned int chunkLength = 0;
+};
+
 /**
  * @brief Utility class for reading demofiles
  */
@@ -24,7 +35,7 @@ public:
 	@brief Open a demofile for reading
 	@throw std::runtime_error Demofile not found / header corrupt / outdated
 	*/
-	CDemoReader(const std::string& filename, float curTime);
+	CDemoReader(const std::string& filename, float curTime, int startFrame = -1, float startTime = -1.0f);
 	virtual ~CDemoReader();
 
 	/**
@@ -42,6 +53,9 @@ public:
 	float GetModGameTime() const { return chunkHeader.modGameTime; }
 	float GetDemoTimeOffset() const { return demoTimeOffset; }
 	float GetNextDemoReadTime() const { return nextDemoReadTime; }
+	bool CaptureStreamState(DemoReaderStreamState& state);
+	bool CaptureStreamStateForFrame(int startFrame, float curTime, DemoReaderStreamState& state);
+	bool RestoreStreamState(const DemoReaderStreamState& state);
 
 	const std::string& GetSetupScript() const
 	{
@@ -56,14 +70,19 @@ public:
 	void LoadStats();
 
 private:
+	void SeekToCheckpointStart(int startFrame, float startTime, float curTime);
+
 	CFileHandler* playbackDemo;
 
 	float demoTimeOffset;
 	float nextDemoReadTime;
 	int bytesRemaining;
 	int playbackDemoSize;
+	int streamStartFilePos;
+	int streamStartBytesRemaining;
 
 	DemoStreamChunkHeader chunkHeader;
+	DemoStreamChunkHeader streamStartChunkHeader;
 
 	std::string setupScript;	// the original, unaltered version from script
 
