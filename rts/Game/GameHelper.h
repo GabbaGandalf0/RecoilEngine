@@ -215,6 +215,25 @@ public:
 	void Kill();
 	void Update();
 
+	void CaptureWaitingDamageState(
+		std::vector<unsigned int>& slotOffsets,
+		std::vector<int>& attackerIDs,
+		std::vector<int>& targetIDs,
+		std::vector<int>& weaponIDs,
+		std::vector<int>& projectileIDs,
+		std::vector<DamageArray>& damages,
+		std::vector<float3>& impulses
+	) const;
+	void RestoreWaitingDamageState(
+		const std::vector<unsigned int>& slotOffsets,
+		const std::vector<int>& attackerIDs,
+		const std::vector<int>& targetIDs,
+		const std::vector<int>& weaponIDs,
+		const std::vector<int>& projectileIDs,
+		const std::vector<DamageArray>& damages,
+		const std::vector<float3>& impulses
+	);
+
 	static float CalcImpulseScale(const DamageArray& damages, const float expDistanceMod);
 
 	void DoExplosionDamage(

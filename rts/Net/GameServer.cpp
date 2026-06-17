@@ -3,6 +3,7 @@
 #include "System/Net/UDPListener.h"
 #include "System/Net/UDPConnection.h"
 
+#include <cstring>
 #include <functional>
 
 #if defined DEDICATED || defined DEBUG
@@ -49,6 +50,7 @@
 #include "System/FileSystem/SimpleParser.h"
 #include "System/Net/Connection.h"
 #include "System/Net/LocalConnection.h"
+#include "System/Net/LoopbackConnection.h"
 #include "System/Net/UnpackPacket.h"
 #include "System/LoadSave/DemoRecorder.h"
 #include "System/LoadSave/DemoReader.h"
@@ -184,7 +186,12 @@ void CGameServer::Initialize()
 	// load demo (if there is one)
 	if (myGameSetup->hostDemo) {
 		Message(spring::format(PlayingDemo, myGameSetup->demoName.c_str()));
-		demoReader.reset(new CDemoReader(myGameSetup->demoName, modGameTime + 0.1f));
+		demoReader.reset(new CDemoReader(
+			myGameSetup->demoName,
+			modGameTime + 0.1f,
+			myGameSetup->replayDemoStartFrame,
+			myGameSetup->replayDemoStartTime
+		));
 	}
 
 	// initialize players, teams & ais
@@ -283,14 +290,213 @@ void CGameServer::Initialize()
 void CGameServer::PostLoad(int newServerFrameNum)
 {
 	std::lock_guard<spring::recursive_mutex> scoped_lock(gameServerMutex);
-	serverFrameNum = newServerFrameNum;
+	const bool keepReplayCheckpointReadAhead =
+		replayCheckpointServerFrameRestorePending &&
+		demoReader != nullptr &&
+		myGameSetup != nullptr &&
+		myGameSetup->replayCheckpoint &&
+		replayCheckpointRestoredServerFrameNum >= newServerFrameNum;
+
+	serverFrameNum = keepReplayCheckpointReadAhead ? replayCheckpointRestoredServerFrameNum : newServerFrameNum;
+	replayCheckpointServerFrameRestorePending = false;
+	replayCheckpointRestoredServerFrameNum = -1;
 
 	gameHasStarted = !PreSimFrame();
+	packetCache.clear();
+
+#ifdef SYNCCHECK
+	outstandingSyncFrames.clear();
+	syncErrorFrame = 0;
+	syncWarningFrame = 0;
+	desyncHasOccurred = false;
+#endif
 
 	// for all GameParticipant's
 	for (GameParticipant& p: players) {
 		p.lastFrameResponse = newServerFrameNum;
+		p.desynced = false;
+
+#ifdef SYNCCHECK
+		p.syncResponse.clear();
+#endif
+
+		for (auto& aiLinkEntry: p.aiClientLinks) {
+			GameParticipant::ClientLinkData& linkData = aiLinkEntry.second;
+			linkData.bandwidthUsage = 0;
+			linkData.numPacketsSent = 0;
+
+			if (linkData.link == nullptr)
+				continue;
+
+			if (auto* loopback = dynamic_cast<netcode::CLoopbackConnection*>(linkData.link.get()))
+				loopback->ClearQueue();
+		}
 	}
+
+	if (keepReplayCheckpointReadAhead) {
+		LOG("[ReplayRewind] preserved checkpoint replay server read-ahead: simFrame=%d serverFrame=%d",
+			newServerFrameNum,
+			serverFrameNum
+		);
+	}
+}
+
+void CGameServer::AlignReplayCheckpointFrame()
+{
+	if (demoReader == nullptr)
+		return;
+	if (myGameSetup == nullptr || !myGameSetup->replayCheckpoint)
+		return;
+
+	const int checkpointFrame = myGameSetup->replayDemoStartFrame;
+	if (checkpointFrame < 0)
+		return;
+	if (serverFrameNum >= checkpointFrame)
+		return;
+
+	if (serverFrameNum < 0) {
+		serverFrameNum = checkpointFrame;
+	} else {
+		serverFrameNum += checkpointFrame;
+	}
+
+	for (GameParticipant& p: players) {
+		if (p.lastFrameResponse < checkpointFrame)
+			p.lastFrameResponse = checkpointFrame;
+		if (p.lastFrameResponse > serverFrameNum)
+			p.lastFrameResponse = serverFrameNum;
+	}
+
+#ifdef SYNCCHECK
+	outstandingSyncFrames.clear();
+	syncErrorFrame = 0;
+	syncWarningFrame = 0;
+	desyncHasOccurred = false;
+#endif
+}
+
+void CGameServer::SkipToReplayFrame(int targetFrameNum)
+{
+	std::lock_guard<spring::recursive_mutex> scoped_lock(gameServerMutex);
+	SkipTo(targetFrameNum);
+}
+
+bool CGameServer::IsReplayCheckpointCaptureSafe(int checkpointFrame)
+{
+	std::lock_guard<spring::recursive_mutex> scoped_lock(gameServerMutex);
+
+	if (demoReader == nullptr)
+		return false;
+
+	// Normal replay delivery stays about one simulation second ahead. A larger
+	// gap means SkipTo has queued future replay packets that do not belong in a
+	// checkpoint captured at the current simulation frame.
+	return (serverFrameNum <= (checkpointFrame + GAME_SPEED));
+}
+
+bool CGameServer::CaptureDemoReaderStreamState(DemoReaderStreamState& state)
+{
+	std::lock_guard<spring::recursive_mutex> scoped_lock(gameServerMutex);
+
+	if (demoReader == nullptr)
+		return false;
+
+	return demoReader->CaptureStreamState(state);
+}
+
+bool CGameServer::RestoreDemoReaderStreamState(const DemoReaderStreamState& state)
+{
+	std::lock_guard<spring::recursive_mutex> scoped_lock(gameServerMutex);
+
+	if (demoReader == nullptr)
+		return false;
+
+	return demoReader->RestoreStreamState(state);
+}
+
+bool CGameServer::CaptureReplayCheckpointNetState(
+	int checkpointFrame,
+	DemoReaderStreamState& demoState,
+	unsigned int& localConnectionInstances,
+	std::vector<std::vector<uint8_t>>& localConnectionQueue0,
+	std::vector<std::vector<uint8_t>>& localConnectionQueue1,
+	int& replayServerFrameNum,
+	float& replayGameTime,
+	float& replayModGameTime,
+	float& replayStartTime
+) {
+	std::lock_guard<spring::recursive_mutex> scoped_lock(gameServerMutex);
+
+	if (demoReader == nullptr)
+		return false;
+
+	replayServerFrameNum = serverFrameNum;
+	replayStartTime = startTime;
+	replayGameTime = gameTime;
+	replayModGameTime = modGameTime;
+
+	// Replay playback deliberately reads ahead: the server can already have
+	// emitted future demo packets into the local client queue while the synced
+	// simulation is still at checkpointFrame. The demo-reader position and the
+	// local queues are one atomic replay-stream state; seeking only the demo
+	// stream back to checkpointFrame changes packet phase and breaks unit IDs.
+	const bool demoStateValid = demoReader->CaptureStreamState(demoState);
+
+	netcode::CLocalConnection::CaptureState(
+		localConnectionInstances,
+		localConnectionQueue0,
+		localConnectionQueue1
+	);
+
+	LOG("[ReplayRewind] captured live replay stream for checkpoint: savedFrame=%d serverFrame=%d modTime=%.3f demoNextTime=%.3f q0=%u q1=%u",
+		checkpointFrame,
+		replayServerFrameNum,
+		replayModGameTime,
+		demoState.nextDemoReadTime,
+		static_cast<unsigned int>(localConnectionQueue0.size()),
+		static_cast<unsigned int>(localConnectionQueue1.size())
+	);
+	return demoStateValid;
+}
+
+bool CGameServer::RestoreReplayCheckpointNetState(
+	const DemoReaderStreamState& demoState,
+	unsigned int localConnectionInstances,
+	const std::vector<std::vector<uint8_t>>& localConnectionQueue0,
+	const std::vector<std::vector<uint8_t>>& localConnectionQueue1,
+	int replayServerFrameNum,
+	float replayGameTime,
+	float replayModGameTime,
+	float replayStartTime
+) {
+	std::lock_guard<spring::recursive_mutex> scoped_lock(gameServerMutex);
+
+	if (demoReader == nullptr)
+		return false;
+
+	const bool demoStateValid = demoReader->RestoreStreamState(demoState);
+	if (!demoStateValid)
+		return false;
+
+	serverFrameNum = replayServerFrameNum;
+	replayCheckpointServerFrameRestorePending = true;
+	replayCheckpointRestoredServerFrameNum = replayServerFrameNum;
+	gameTime = replayGameTime;
+	modGameTime = replayModGameTime;
+	startTime = replayStartTime;
+	lastUpdate = spring_gettime();
+	lastNewFrameTick = spring_gettime();
+
+	// Queue restore here and apply after CGameServer::PostLoad has cleared
+	// startup packets. The local queues are part of the captured replay stream:
+	// they contain demo packets already emitted by the read-ahead server but
+	// not yet consumed by the synced client simulation at the checkpoint.
+	netcode::CLocalConnection::QueueRestoreState(
+		localConnectionInstances,
+		localConnectionQueue0,
+		localConnectionQueue1
+	);
+	return true;
 }
 
 
@@ -404,6 +610,8 @@ void CGameServer::SkipTo(int targetFrameNum)
 {
 	const bool wasPaused = isPaused;
 
+	AlignReplayCheckpointFrame();
+
 	if (!gameHasStarted) { return; }
 	if (serverFrameNum >= targetFrameNum) { return; }
 	if (demoReader == nullptr) { return; }
@@ -418,7 +626,7 @@ void CGameServer::SkipTo(int targetFrameNum)
 	// since we do we NOT go through ::Update when skipping
 	while (SendDemoData(targetFrameNum)) {
 		gameTime = GetDemoTime();
-		modGameTime = demoReader->GetModGameTime() + 0.001f;
+		modGameTime = demoReader->GetNextDemoReadTime() + 0.001f;
 
 		if (udpListener == nullptr) { continue; }
 		if ((serverFrameNum % 20) != 0) { continue; }
@@ -469,8 +677,29 @@ bool CGameServer::SendDemoData(int targetFrameNum)
 		const unsigned msgCode = buf->data[0];
 
 		switch (msgCode) {
-			case NETMSG_NEWFRAME:
 			case NETMSG_KEYFRAME: {
+				// we can't use CreateNewFrame() here
+				lastNewFrameTick = spring_gettime();
+
+				if (buf->length < 5) {
+					Message("Warning: Discarding invalid keyframe packet in demo");
+					continue;
+				}
+
+				std::memcpy(&serverFrameNum, buf->data + 1, sizeof(serverFrameNum));
+
+			#ifdef SYNCCHECK
+				if (targetFrameNum == -1) {
+					// not skipping
+					outstandingSyncFrames.insert(serverFrameNum);
+				}
+				CheckSync();
+			#endif
+
+				Broadcast(rpkt);
+				break;
+			}
+			case NETMSG_NEWFRAME: {
 				// we can't use CreateNewFrame() here
 				lastNewFrameTick = spring_gettime();
 				serverFrameNum++;
@@ -511,6 +740,14 @@ bool CGameServer::SendDemoData(int targetFrameNum)
 			case NETMSG_USER_SPEED:
 			case NETMSG_INTERNAL_SPEED: {
 				// never send these from demos
+				break;
+			}
+			case NETMSG_PATH_CHECKSUM:
+			case NETMSG_SYNCRESPONSE: {
+				if (myGameSetup->replayCheckpoint)
+					break;
+
+				Broadcast(rpkt);
 				break;
 			}
 			case NETMSG_CCOMMAND: {
@@ -2245,6 +2482,8 @@ void CGameServer::StartGame(bool forced)
 	UserSpeedChange(userSpeedFactor, SERVER_PLAYER);
 
 	if (demoReader) {
+		AlignReplayCheckpointFrame();
+
 		// the client told us to start a demo
 		// no need to send startPos and startplaying since its in the demo
 		Message(DemoStart);
@@ -2540,7 +2779,7 @@ void CGameServer::PushAction(const Action& action, bool fromAutoHost)
 			// the next time-index must be "close enough" not
 			// to move past more than 1 NETMSG_NEWFRAME
 			if (demoReader != nullptr)
-				modGameTime = demoReader->GetModGameTime() + 0.001f;
+				modGameTime = demoReader->GetNextDemoReadTime() + 0.001f;
 
 			CreateNewFrame(true, true);
 		} break;
@@ -3154,4 +3393,3 @@ uint8_t CGameServer::ReserveSkirmishAIId()
 	freeSkirmishAIs.pop_back();
 	return id;
 }
-

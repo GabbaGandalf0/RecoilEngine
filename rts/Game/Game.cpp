@@ -85,17 +85,23 @@
 #include "Sim/Misc/TeamHandler.h"
 #include "Sim/Misc/Wind.h"
 #include "Sim/Misc/ResourceHandler.h"
+#include "Sim/Ecs/Registry.h"
+#include "Sim/MoveTypes/Components/MoveTypesComponents.h"
 #include "Sim/MoveTypes/MoveDefHandler.h"
+#include "Sim/MoveTypes/GroundMoveType.h"
 #include "Sim/MoveTypes/MoveTypeFactory.h"
 #include "Sim/Path/IPathManager.h"
+#include "Sim/Path/QTPFS/PathManager.h"
 #include "Sim/Projectiles/ExplosionGenerator.h"
 #include "Sim/Projectiles/Projectile.h"
 #include "Sim/Projectiles/ProjectileHandler.h"
+#include "Sim/Projectiles/WeaponProjectiles/WeaponProjectile.h"
 #include "Sim/Units/CommandAI/CommandAI.h"
 #include "Sim/Units/Scripts/UnitScriptFactory.h"
 #include "Sim/Units/Scripts/UnitScriptEngine.h"
 #include "Sim/Units/UnitHandler.h"
 #include "Sim/Units/UnitDefHandler.h"
+#include "Sim/Weapons/Weapon.h"
 #include "Sim/Weapons/WeaponDefHandler.h"
 #include "Sim/Weapons/WeaponLoader.h"
 #include "UI/CommandColors.h"
@@ -113,16 +119,22 @@
 #include "UI/Groups/GroupHandler.h"
 #include "System/Config/ConfigHandler.h"
 #include "System/creg/SerializeLuaState.h"
+#include "System/creg/Serializer.h"
 #include "System/EventHandler.h"
 #include "System/Exceptions.h"
 #include "System/Sync/FPUCheck.h"
 #include "System/SafeUtil.h"
 #include "System/SpringExitCode.h"
 #include "System/SpringMath.h"
+#include "System/FileSystem/DataDirsAccess.h"
+#include "System/FileSystem/FileHandler.h"
+#include "System/FileSystem/FileQueryFlags.h"
 #include "System/FileSystem/FileSystem.h"
 #include "System/LoadSave/LoadSaveHandler.h"
+#include "System/LoadSave/CregLoadSaveHandler.h"
 #include "System/LoadSave/DemoRecorder.h"
 #include "System/Log/ILog.h"
+#include "System/Net/LocalConnection.h"
 #include "System/Platform/Misc.h"
 #include "System/Platform/Watchdog.h"
 #include "System/Platform/errorhandler.h"
@@ -134,10 +146,1397 @@
 
 #include "System/Misc/TracyDefs.h"
 
+namespace netcode {
+	void RestoreLocalSyncChecksum(int32_t frameNum, uint32_t checksum);
+}
+
+#include "fmt/format.h"
 #include "fmt/ranges.h"
+
+#include <algorithm>
+#include <cctype>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <sstream>
+#include <unordered_map>
+#include <vector>
 
 
 #undef CreateDirectory
+
+namespace {
+	struct ReplayResumeRequest {
+		bool active = false;
+		bool expectCheckpoint = false;
+		int targetFrame = -1;
+		float targetTime = -1.0f;
+		std::string demoName;
+	};
+
+	static ReplayResumeRequest replayResumeRequest;
+
+	static constexpr int replayAutoCheckpointInterval = 600;
+
+	static std::string QuoteTdfValue(const std::string& value)
+	{
+		std::string escaped;
+		escaped.reserve(value.size() + 2);
+
+		for (const char c: value) {
+			if (c == '\\' || c == '"')
+				escaped.push_back('\\');
+
+			escaped.push_back(c);
+		}
+
+		return "\"" + escaped + "\"";
+	}
+
+	static std::string FormatReplayTime(int totalSeconds)
+	{
+		totalSeconds = std::max(0, totalSeconds);
+
+		const int hours = totalSeconds / 3600;
+		const int minutes = (totalSeconds % 3600) / 60;
+		const int seconds = totalSeconds % 60;
+
+		if (hours > 0)
+			return fmt::format("{}:{:02d}:{:02d}", hours, minutes, seconds);
+
+		return fmt::format("{:02d}:{:02d}", minutes, seconds);
+	}
+
+	struct RewindAuditSettings {
+		bool initialized = false;
+		bool enabled = false;
+		int periodFrames = 900;
+		std::vector<int> frames;
+		std::string label = "audit";
+		std::string outputPath;
+	};
+
+	static uint32_t RewindAuditFloatBits(float value)
+	{
+		uint32_t bits = 0;
+		static_assert(sizeof(bits) == sizeof(value));
+		std::memcpy(&bits, &value, sizeof(bits));
+		return bits;
+	}
+
+	static void RewindAuditMix(uint64_t& digest, uint64_t value)
+	{
+		digest ^= value;
+		digest *= 1099511628211ull;
+	}
+
+	static void RewindAuditMixFloat3(uint64_t& digest, const float3& value)
+	{
+		RewindAuditMix(digest, RewindAuditFloatBits(value.x));
+		RewindAuditMix(digest, RewindAuditFloatBits(value.y));
+		RewindAuditMix(digest, RewindAuditFloatBits(value.z));
+	}
+
+	static std::string SanitizeRewindAuditLabel(std::string label)
+	{
+		for (char& c: label) {
+			const unsigned char uc = static_cast<unsigned char>(c);
+			if (!std::isalnum(uc) && c != '_' && c != '-' && c != '.')
+				c = '_';
+		}
+
+		if (label.empty())
+			label = "audit";
+		if (label.size() > 80)
+			label.resize(80);
+
+		return label;
+	}
+
+	static int ParseRewindAuditTimeToken(const std::string& token)
+	{
+		if (token.empty())
+			return -1;
+
+		if (token.find(':') == std::string::npos) {
+			char* end = nullptr;
+			const long frame = std::strtol(token.c_str(), &end, 10);
+			return (end != token.c_str() && *end == '\0' && frame >= 0) ? static_cast<int>(frame) : -1;
+		}
+
+		std::vector<int> parts;
+		std::stringstream stream(token);
+		std::string part;
+		while (std::getline(stream, part, ':')) {
+			char* end = nullptr;
+			const long value = std::strtol(part.c_str(), &end, 10);
+			if (end == part.c_str() || *end != '\0' || value < 0)
+				return -1;
+			parts.push_back(static_cast<int>(value));
+		}
+
+		if (parts.size() == 2)
+			return ((parts[0] * 60) + parts[1]) * GAME_SPEED;
+		if (parts.size() == 3)
+			return ((parts[0] * 3600) + (parts[1] * 60) + parts[2]) * GAME_SPEED;
+
+		return -1;
+	}
+
+	static std::vector<int> ParseRewindAuditFrames(const std::string& value)
+	{
+		std::vector<int> frames;
+		std::string token;
+
+		const auto flushToken = [&]() {
+			const int frame = ParseRewindAuditTimeToken(token);
+			if (frame >= 0)
+				frames.push_back(frame);
+			token.clear();
+		};
+
+		for (const char c: value) {
+			if (c == ',' || c == ';' || std::isspace(static_cast<unsigned char>(c))) {
+				if (!token.empty())
+					flushToken();
+				continue;
+			}
+
+			token.push_back(c);
+		}
+
+		if (!token.empty())
+			flushToken();
+
+		std::sort(frames.begin(), frames.end());
+		frames.erase(std::unique(frames.begin(), frames.end()), frames.end());
+		return frames;
+	}
+
+	static RewindAuditSettings& GetRewindAuditSettings()
+	{
+		static RewindAuditSettings settings;
+
+		if (settings.initialized)
+			return settings;
+
+		settings.initialized = true;
+		settings.enabled = configHandler->GetBool("RewindAudit");
+		settings.periodFrames = std::max(0, configHandler->GetInt("RewindAuditPeriod"));
+		settings.frames = ParseRewindAuditFrames(configHandler->GetString("RewindAuditFrames"));
+		settings.label = SanitizeRewindAuditLabel(configHandler->GetString("RewindAuditLabel"));
+
+		if (!settings.enabled)
+			return settings;
+
+		settings.outputPath = dataDirsAccess.LocateFile(
+			fmt::format("rewind_audit/{}/audit.log", settings.label),
+			FileQueryFlags::WRITE | FileQueryFlags::CREATE_DIRS
+		);
+
+		std::ofstream file(settings.outputPath, std::ios::out | std::ios::trunc);
+		if (file.is_open()) {
+			file << "# BAR Rewind audit log\n";
+			file << "# This file is diagnostic output only. It does not modify replay files or replay command data.\n";
+			file << "label=" << settings.label << "\n";
+			file << "periodFrames=" << settings.periodFrames << "\n";
+			file << "frames=" << configHandler->GetString("RewindAuditFrames") << "\n";
+			if (gameSetup != nullptr) {
+				file << "map=" << gameSetup->mapName << "\n";
+				file << "mod=" << gameSetup->modName << "\n";
+				file << "demoFile=" << FileSystem::GetFilename(gameSetup->demoName) << "\n";
+			}
+		}
+
+		LOG("[RewindAudit] enabled, writing to %s", settings.outputPath.c_str());
+		return settings;
+	}
+
+	static bool ShouldWriteRewindAuditFrame(const int frameNum)
+	{
+		RewindAuditSettings& settings = GetRewindAuditSettings();
+		if (!settings.enabled)
+			return false;
+
+		if (std::binary_search(settings.frames.begin(), settings.frames.end(), frameNum))
+			return true;
+
+		return (settings.periodFrames > 0 && frameNum >= 0 && (frameNum % settings.periodFrames) == 0);
+	}
+
+	static void AppendRewindAuditLine(const std::string& line)
+	{
+		const RewindAuditSettings& settings = GetRewindAuditSettings();
+		if (!settings.enabled || settings.outputPath.empty())
+			return;
+
+		std::ofstream file(settings.outputPath, std::ios::out | std::ios::app);
+		if (file.is_open())
+			file << line << '\n';
+	}
+
+	static uint64_t BuildRewindAuditTeamDigest()
+	{
+		uint64_t digest = 1469598103934665603ull;
+
+		for (int teamNum = 0; teamNum < teamHandler.ActiveTeams(); ++teamNum) {
+			const CTeam* team = teamHandler.Team(teamNum);
+			if (team == nullptr)
+				continue;
+
+			RewindAuditMix(digest, static_cast<uint64_t>(team->teamNum));
+			RewindAuditMix(digest, static_cast<uint64_t>(team->leader));
+			RewindAuditMix(digest, static_cast<uint64_t>(team->isDead));
+			RewindAuditMix(digest, static_cast<uint64_t>(team->gaia));
+			RewindAuditMix(digest, RewindAuditFloatBits(team->res.metal));
+			RewindAuditMix(digest, RewindAuditFloatBits(team->res.energy));
+			RewindAuditMix(digest, RewindAuditFloatBits(team->resStorage.metal));
+			RewindAuditMix(digest, RewindAuditFloatBits(team->resStorage.energy));
+			RewindAuditMix(digest, RewindAuditFloatBits(team->resIncome.metal));
+			RewindAuditMix(digest, RewindAuditFloatBits(team->resIncome.energy));
+			RewindAuditMix(digest, RewindAuditFloatBits(team->resExpense.metal));
+			RewindAuditMix(digest, RewindAuditFloatBits(team->resExpense.energy));
+			RewindAuditMix(digest, RewindAuditFloatBits(team->resPull.metal));
+			RewindAuditMix(digest, RewindAuditFloatBits(team->resPull.energy));
+			RewindAuditMix(digest, RewindAuditFloatBits(team->resShare.metal));
+			RewindAuditMix(digest, RewindAuditFloatBits(team->resShare.energy));
+		}
+
+		return digest;
+	}
+
+	static std::vector<const CUnit*> GetSortedRewindAuditUnits()
+	{
+		std::vector<const CUnit*> units;
+		units.reserve(unitHandler.GetActiveUnits().size());
+
+		for (const CUnit* unit: unitHandler.GetActiveUnits()) {
+			if (unit != nullptr)
+				units.push_back(unit);
+		}
+
+		std::sort(units.begin(), units.end(), [](const CUnit* a, const CUnit* b) {
+			return (a->id < b->id);
+		});
+
+		return units;
+	}
+
+	static uint64_t BuildRewindAuditCommandDigest(const std::vector<const CUnit*>& units)
+	{
+		uint64_t digest = 1469598103934665603ull;
+
+		for (const CUnit* unit: units) {
+			const CCommandAI* commandAI = unit->commandAI;
+			if (commandAI == nullptr)
+				continue;
+
+			RewindAuditMix(digest, static_cast<uint64_t>(unit->id));
+			RewindAuditMix(digest, static_cast<uint64_t>(commandAI->lastUserCommand));
+			RewindAuditMix(digest, static_cast<uint64_t>(commandAI->selfDCountdown));
+			RewindAuditMix(digest, static_cast<uint64_t>(commandAI->lastFinishCommand));
+			RewindAuditMix(digest, static_cast<uint64_t>(commandAI->targetDied));
+			RewindAuditMix(digest, static_cast<uint64_t>(commandAI->repeatOrders));
+			RewindAuditMix(digest, static_cast<uint64_t>(commandAI->lastSelectedCommandPage));
+			RewindAuditMix(digest, static_cast<uint64_t>(commandAI->inCommand));
+			RewindAuditMix(digest, static_cast<uint64_t>(commandAI->commandQue.size()));
+
+			for (const Command& command: commandAI->commandQue) {
+				RewindAuditMix(digest, static_cast<uint64_t>(command.GetID()));
+				RewindAuditMix(digest, static_cast<uint64_t>(command.GetID(true)));
+				RewindAuditMix(digest, static_cast<uint64_t>(command.GetTimeOut()));
+				RewindAuditMix(digest, static_cast<uint64_t>(command.GetpageIndex()));
+				RewindAuditMix(digest, static_cast<uint64_t>(command.GetNumParams()));
+				RewindAuditMix(digest, static_cast<uint64_t>(command.GetTag()));
+				RewindAuditMix(digest, static_cast<uint64_t>(command.GetOpts()));
+
+				for (unsigned int paramIdx = 0; paramIdx < command.GetNumParams(); ++paramIdx)
+					RewindAuditMix(digest, RewindAuditFloatBits(command.GetParam(paramIdx)));
+			}
+		}
+
+		return digest;
+	}
+
+	struct RewindAuditUnitDigests {
+		uint64_t identityDigest = 1469598103934665603ull;
+		uint64_t kinematicsDigest = 1469598103934665603ull;
+		uint64_t moveDigest = 1469598103934665603ull;
+		uint64_t combinedDigest = 1469598103934665603ull;
+	};
+
+	struct RewindAuditUnitSnapshot {
+		int id = -1;
+		int team = -1;
+		int unitDefId = -1;
+		int commandCount = 0;
+		int firstCommandId = 0;
+		int progressState = 0;
+		unsigned int pathID = 0;
+		float3 pos;
+		float3 speed;
+		float3 goalPos;
+		float3 oldPos;
+		float3 oldSlowUpdatePos;
+		float3 currWayPoint;
+		float3 nextWayPoint;
+		float3 frontDir;
+		float3 rightDir;
+		float3 upDir;
+		float health = 0.0f;
+		float currentSpeed = 0.0f;
+		float wantedSpeed = 0.0f;
+		float deltaSpeed = 0.0f;
+		float currWayPointDist = 0.0f;
+		float prevWayPointDist = 0.0f;
+		short heading = 0;
+		short buildFacing = 0;
+		bool atGoal = false;
+		bool reversing = false;
+	};
+
+	static bool RewindAuditSameFloat(float a, float b)
+	{
+		return (RewindAuditFloatBits(a) == RewindAuditFloatBits(b));
+	}
+
+	static bool RewindAuditSameFloat3(const float3& a, const float3& b)
+	{
+		return (
+			RewindAuditSameFloat(a.x, b.x) &&
+			RewindAuditSameFloat(a.y, b.y) &&
+			RewindAuditSameFloat(a.z, b.z)
+		);
+	}
+
+	static std::string RewindAuditFormatFloat3(const float3& value)
+	{
+		return fmt::format("{:.3f},{:.3f},{:.3f}", value.x, value.y, value.z);
+	}
+
+	static RewindAuditUnitSnapshot BuildRewindAuditUnitSnapshot(const CUnit* unit)
+	{
+		RewindAuditUnitSnapshot snapshot;
+		if (unit == nullptr)
+			return snapshot;
+
+		snapshot.id = unit->id;
+		snapshot.team = unit->team;
+		snapshot.unitDefId = (unit->unitDef != nullptr) ? unit->unitDef->id : -1;
+		snapshot.pos = unit->pos;
+		snapshot.speed = float3(unit->speed.x, unit->speed.y, unit->speed.z);
+		snapshot.health = unit->health;
+		snapshot.heading = unit->heading;
+		snapshot.buildFacing = unit->buildFacing;
+		snapshot.frontDir = unit->frontdir;
+		snapshot.rightDir = unit->rightdir;
+		snapshot.upDir = unit->updir;
+
+		if (unit->commandAI != nullptr) {
+			snapshot.commandCount = static_cast<int>(unit->commandAI->commandQue.size());
+			if (!unit->commandAI->commandQue.empty())
+				snapshot.firstCommandId = unit->commandAI->commandQue.front().GetID();
+		}
+
+		if (unit->moveType != nullptr) {
+			snapshot.goalPos = unit->moveType->goalPos;
+			snapshot.oldPos = unit->moveType->oldPos;
+			snapshot.oldSlowUpdatePos = unit->moveType->oldSlowUpdatePos;
+			snapshot.progressState = unit->moveType->progressState;
+		}
+
+		if (const auto* groundMoveType = dynamic_cast<const CGroundMoveType*>(unit->moveType); groundMoveType != nullptr) {
+			snapshot.pathID = groundMoveType->GetPathID();
+			snapshot.currWayPoint = groundMoveType->GetCurrWayPoint();
+			snapshot.nextWayPoint = groundMoveType->GetNextWayPoint();
+			snapshot.currentSpeed = groundMoveType->GetCurrentSpeed();
+			snapshot.wantedSpeed = groundMoveType->GetWantedSpeed();
+			snapshot.deltaSpeed = groundMoveType->GetDeltaSpeed();
+			snapshot.currWayPointDist = groundMoveType->GetCurrWayPointDist();
+			snapshot.prevWayPointDist = groundMoveType->GetPrevWayPointDist();
+			snapshot.atGoal = groundMoveType->IsAtGoal();
+			snapshot.reversing = groundMoveType->IsReversing();
+		}
+
+		return snapshot;
+	}
+
+	static bool RewindAuditUnitSnapshotDiffers(const RewindAuditUnitSnapshot& a, const RewindAuditUnitSnapshot& b)
+	{
+		return (
+			a.team != b.team ||
+			a.unitDefId != b.unitDefId ||
+			a.commandCount != b.commandCount ||
+			a.firstCommandId != b.firstCommandId ||
+			a.progressState != b.progressState ||
+			a.pathID != b.pathID ||
+			!RewindAuditSameFloat3(a.pos, b.pos) ||
+			!RewindAuditSameFloat3(a.speed, b.speed) ||
+			!RewindAuditSameFloat3(a.goalPos, b.goalPos) ||
+			!RewindAuditSameFloat3(a.oldPos, b.oldPos) ||
+			!RewindAuditSameFloat3(a.oldSlowUpdatePos, b.oldSlowUpdatePos) ||
+			!RewindAuditSameFloat3(a.currWayPoint, b.currWayPoint) ||
+			!RewindAuditSameFloat3(a.nextWayPoint, b.nextWayPoint) ||
+			!RewindAuditSameFloat3(a.frontDir, b.frontDir) ||
+			!RewindAuditSameFloat3(a.rightDir, b.rightDir) ||
+			!RewindAuditSameFloat3(a.upDir, b.upDir) ||
+			!RewindAuditSameFloat(a.health, b.health) ||
+			!RewindAuditSameFloat(a.currentSpeed, b.currentSpeed) ||
+			!RewindAuditSameFloat(a.wantedSpeed, b.wantedSpeed) ||
+			!RewindAuditSameFloat(a.deltaSpeed, b.deltaSpeed) ||
+			!RewindAuditSameFloat(a.currWayPointDist, b.currWayPointDist) ||
+			!RewindAuditSameFloat(a.prevWayPointDist, b.prevWayPointDist) ||
+			a.heading != b.heading ||
+			a.buildFacing != b.buildFacing ||
+			a.atGoal != b.atGoal ||
+			a.reversing != b.reversing
+		);
+	}
+
+	static std::string RewindAuditUnitDifferenceNames(const RewindAuditUnitSnapshot& ref, const RewindAuditUnitSnapshot& cur)
+	{
+		std::vector<std::string> names;
+		if (ref.team != cur.team) names.emplace_back("team");
+		if (ref.unitDefId != cur.unitDefId) names.emplace_back("unitDef");
+		if (ref.commandCount != cur.commandCount) names.emplace_back("cmdCount");
+		if (ref.firstCommandId != cur.firstCommandId) names.emplace_back("firstCmd");
+		if (ref.progressState != cur.progressState) names.emplace_back("progress");
+		if (ref.pathID != cur.pathID) names.emplace_back("pathID");
+		if (!RewindAuditSameFloat3(ref.pos, cur.pos)) names.emplace_back("pos");
+		if (!RewindAuditSameFloat3(ref.speed, cur.speed)) names.emplace_back("speed");
+		if (!RewindAuditSameFloat3(ref.goalPos, cur.goalPos)) names.emplace_back("goal");
+		if (!RewindAuditSameFloat3(ref.oldPos, cur.oldPos)) names.emplace_back("oldPos");
+		if (!RewindAuditSameFloat3(ref.oldSlowUpdatePos, cur.oldSlowUpdatePos)) names.emplace_back("oldSlowPos");
+		if (!RewindAuditSameFloat3(ref.currWayPoint, cur.currWayPoint)) names.emplace_back("currWP");
+		if (!RewindAuditSameFloat3(ref.nextWayPoint, cur.nextWayPoint)) names.emplace_back("nextWP");
+		if (!RewindAuditSameFloat3(ref.frontDir, cur.frontDir)) names.emplace_back("frontDir");
+		if (!RewindAuditSameFloat3(ref.rightDir, cur.rightDir)) names.emplace_back("rightDir");
+		if (!RewindAuditSameFloat3(ref.upDir, cur.upDir)) names.emplace_back("upDir");
+		if (!RewindAuditSameFloat(ref.health, cur.health)) names.emplace_back("health");
+		if (!RewindAuditSameFloat(ref.currentSpeed, cur.currentSpeed)) names.emplace_back("curSpeed");
+		if (!RewindAuditSameFloat(ref.wantedSpeed, cur.wantedSpeed)) names.emplace_back("wantSpeed");
+		if (!RewindAuditSameFloat(ref.deltaSpeed, cur.deltaSpeed)) names.emplace_back("deltaSpeed");
+		if (!RewindAuditSameFloat(ref.currWayPointDist, cur.currWayPointDist)) names.emplace_back("currWPD");
+		if (!RewindAuditSameFloat(ref.prevWayPointDist, cur.prevWayPointDist)) names.emplace_back("prevWPD");
+		if (ref.heading != cur.heading) names.emplace_back("heading");
+		if (ref.buildFacing != cur.buildFacing) names.emplace_back("buildFacing");
+		if (ref.atGoal != cur.atGoal) names.emplace_back("atGoal");
+		if (ref.reversing != cur.reversing) names.emplace_back("reversing");
+		return fmt::format("{}", fmt::join(names, ","));
+	}
+
+	static std::string RewindAuditFormatUnitSnapshot(const RewindAuditUnitSnapshot& snapshot)
+	{
+		return fmt::format(
+			"id={} team={} def={} pos=[{}] speed=[{}] health={:.3f} heading={} front=[{}] right=[{}] up=[{}] goal=[{}] oldPos=[{}] oldSlow=[{}] progress={} path={} currWP=[{}] nextWP=[{}] curSpeed={:.3f} wanted={:.3f} delta={:.3f} currWPD={:.3f} prevWPD={:.3f} atGoal={} reversing={} cmds={} firstCmd={}",
+			snapshot.id,
+			snapshot.team,
+			snapshot.unitDefId,
+			RewindAuditFormatFloat3(snapshot.pos),
+			RewindAuditFormatFloat3(snapshot.speed),
+			snapshot.health,
+			snapshot.heading,
+			RewindAuditFormatFloat3(snapshot.frontDir),
+			RewindAuditFormatFloat3(snapshot.rightDir),
+			RewindAuditFormatFloat3(snapshot.upDir),
+			RewindAuditFormatFloat3(snapshot.goalPos),
+			RewindAuditFormatFloat3(snapshot.oldPos),
+			RewindAuditFormatFloat3(snapshot.oldSlowUpdatePos),
+			snapshot.progressState,
+			snapshot.pathID,
+			RewindAuditFormatFloat3(snapshot.currWayPoint),
+			RewindAuditFormatFloat3(snapshot.nextWayPoint),
+			snapshot.currentSpeed,
+			snapshot.wantedSpeed,
+			snapshot.deltaSpeed,
+			snapshot.currWayPointDist,
+			snapshot.prevWayPointDist,
+			int(snapshot.atGoal),
+			int(snapshot.reversing),
+			snapshot.commandCount,
+			snapshot.firstCommandId
+		);
+	}
+
+	static void CompareOrStoreRewindAuditUnitSnapshots(const int frameNum, const std::vector<const CUnit*>& units)
+	{
+		static std::unordered_map<int, std::vector<RewindAuditUnitSnapshot>> referenceSnapshots;
+
+		std::vector<RewindAuditUnitSnapshot> currentSnapshots;
+		currentSnapshots.reserve(units.size());
+		for (const CUnit* unit: units)
+			currentSnapshots.emplace_back(BuildRewindAuditUnitSnapshot(unit));
+
+		const auto refIt = referenceSnapshots.find(frameNum);
+		if (refIt == referenceSnapshots.end()) {
+			referenceSnapshots.emplace(frameNum, std::move(currentSnapshots));
+			return;
+		}
+
+		const auto& refSnapshots = refIt->second;
+		std::size_t refIdx = 0;
+		std::size_t curIdx = 0;
+		unsigned int loggedDiffs = 0;
+		unsigned int totalDiffs = 0;
+		constexpr unsigned int maxLoggedDiffs = 12;
+
+		while (refIdx < refSnapshots.size() || curIdx < currentSnapshots.size()) {
+			const RewindAuditUnitSnapshot* ref = (refIdx < refSnapshots.size()) ? &refSnapshots[refIdx] : nullptr;
+			const RewindAuditUnitSnapshot* cur = (curIdx < currentSnapshots.size()) ? &currentSnapshots[curIdx] : nullptr;
+
+			if (ref != nullptr && cur != nullptr && ref->id == cur->id) {
+				if (RewindAuditUnitSnapshotDiffers(*ref, *cur)) {
+					totalDiffs += 1;
+					if (loggedDiffs < maxLoggedDiffs) {
+						AppendRewindAuditLine(fmt::format(
+							"detail frame={} unit={} diff={} reference=\"{}\" current=\"{}\"",
+							frameNum,
+							ref->id,
+							RewindAuditUnitDifferenceNames(*ref, *cur),
+							RewindAuditFormatUnitSnapshot(*ref),
+							RewindAuditFormatUnitSnapshot(*cur)
+						));
+						loggedDiffs += 1;
+					}
+				}
+				refIdx += 1;
+				curIdx += 1;
+				continue;
+			}
+
+			if (cur == nullptr || (ref != nullptr && ref->id < cur->id)) {
+				totalDiffs += 1;
+				if (loggedDiffs < maxLoggedDiffs) {
+					AppendRewindAuditLine(fmt::format(
+						"detail frame={} missing-current unit={} reference=\"{}\"",
+						frameNum,
+						ref->id,
+						RewindAuditFormatUnitSnapshot(*ref)
+					));
+					loggedDiffs += 1;
+				}
+				refIdx += 1;
+				continue;
+			}
+
+			totalDiffs += 1;
+			if (loggedDiffs < maxLoggedDiffs) {
+				AppendRewindAuditLine(fmt::format(
+					"detail frame={} missing-reference unit={} current=\"{}\"",
+					frameNum,
+					cur->id,
+					RewindAuditFormatUnitSnapshot(*cur)
+				));
+				loggedDiffs += 1;
+			}
+			curIdx += 1;
+		}
+
+		if (totalDiffs > 0) {
+			AppendRewindAuditLine(fmt::format(
+				"detail-summary frame={} differingUnits={} logged={}",
+				frameNum,
+				totalDiffs,
+				loggedDiffs
+			));
+		}
+	}
+
+	static RewindAuditUnitDigests BuildRewindAuditUnitDigests(const std::vector<const CUnit*>& units)
+	{
+		RewindAuditUnitDigests digests;
+
+		for (const CUnit* unit: units) {
+			RewindAuditMix(digests.identityDigest, static_cast<uint64_t>(unit->id));
+			RewindAuditMix(digests.identityDigest, static_cast<uint64_t>(unit->team));
+			RewindAuditMix(digests.identityDigest, static_cast<uint64_t>((unit->unitDef != nullptr) ? unit->unitDef->id : -1));
+			RewindAuditMix(digests.identityDigest, static_cast<uint64_t>(unit->isDead));
+			RewindAuditMix(digests.identityDigest, static_cast<uint64_t>(unit->IsStunned()));
+			RewindAuditMix(digests.identityDigest, static_cast<uint64_t>(unit->beingBuilt));
+			RewindAuditMix(digests.identityDigest, static_cast<uint64_t>(unit->fireState));
+			RewindAuditMix(digests.identityDigest, static_cast<uint64_t>(unit->moveState));
+
+			RewindAuditMix(digests.kinematicsDigest, static_cast<uint64_t>(unit->id));
+			RewindAuditMixFloat3(digests.kinematicsDigest, unit->pos);
+			RewindAuditMix(digests.kinematicsDigest, RewindAuditFloatBits(unit->speed.x));
+			RewindAuditMix(digests.kinematicsDigest, RewindAuditFloatBits(unit->speed.y));
+			RewindAuditMix(digests.kinematicsDigest, RewindAuditFloatBits(unit->speed.z));
+			RewindAuditMix(digests.kinematicsDigest, RewindAuditFloatBits(unit->speed.w));
+			RewindAuditMix(digests.kinematicsDigest, RewindAuditFloatBits(unit->health));
+			RewindAuditMix(digests.kinematicsDigest, static_cast<uint64_t>(unit->heading));
+			RewindAuditMix(digests.kinematicsDigest, static_cast<uint64_t>(unit->buildFacing));
+			RewindAuditMixFloat3(digests.kinematicsDigest, unit->frontdir);
+			RewindAuditMixFloat3(digests.kinematicsDigest, unit->rightdir);
+			RewindAuditMixFloat3(digests.kinematicsDigest, unit->updir);
+
+			if (unit->moveType != nullptr) {
+				RewindAuditMix(digests.moveDigest, static_cast<uint64_t>(unit->id));
+				RewindAuditMixFloat3(digests.moveDigest, unit->moveType->goalPos);
+				RewindAuditMixFloat3(digests.moveDigest, unit->moveType->oldPos);
+				RewindAuditMixFloat3(digests.moveDigest, unit->moveType->oldSlowUpdatePos);
+				RewindAuditMix(digests.moveDigest, static_cast<uint64_t>(unit->moveType->progressState));
+
+				if (const auto* groundMoveType = dynamic_cast<const CGroundMoveType*>(unit->moveType); groundMoveType != nullptr) {
+					RewindAuditMix(digests.moveDigest, static_cast<uint64_t>(groundMoveType->GetPathID()));
+					RewindAuditMixFloat3(digests.moveDigest, groundMoveType->GetCurrWayPoint());
+					RewindAuditMixFloat3(digests.moveDigest, groundMoveType->GetNextWayPoint());
+					RewindAuditMix(digests.moveDigest, RewindAuditFloatBits(groundMoveType->GetCurrentSpeed()));
+					RewindAuditMix(digests.moveDigest, RewindAuditFloatBits(groundMoveType->GetWantedSpeed()));
+					RewindAuditMix(digests.moveDigest, RewindAuditFloatBits(groundMoveType->GetDeltaSpeed()));
+					RewindAuditMix(digests.moveDigest, RewindAuditFloatBits(groundMoveType->GetCurrWayPointDist()));
+					RewindAuditMix(digests.moveDigest, RewindAuditFloatBits(groundMoveType->GetPrevWayPointDist()));
+					RewindAuditMix(digests.moveDigest, static_cast<uint64_t>(groundMoveType->IsReversing()));
+					RewindAuditMix(digests.moveDigest, static_cast<uint64_t>(groundMoveType->IsAtGoal()));
+				}
+			} else {
+				RewindAuditMix(digests.moveDigest, static_cast<uint64_t>(unit->id));
+				RewindAuditMix(digests.moveDigest, 0ull);
+			}
+		}
+
+		digests.combinedDigest = digests.identityDigest;
+		RewindAuditMix(digests.combinedDigest, digests.kinematicsDigest);
+		RewindAuditMix(digests.combinedDigest, digests.moveDigest);
+
+		return digests;
+	}
+
+	static uint64_t BuildRewindAuditFeatureDigest(unsigned int& activeFeatures)
+	{
+		std::vector<int> featureIDs(featureHandler.GetActiveFeatureIDs().begin(), featureHandler.GetActiveFeatureIDs().end());
+		std::sort(featureIDs.begin(), featureIDs.end());
+		activeFeatures = static_cast<unsigned int>(featureIDs.size());
+
+		uint64_t digest = 1469598103934665603ull;
+		for (const int featureID: featureIDs) {
+			const CFeature* feature = featureHandler.GetFeature(featureID);
+			if (feature == nullptr)
+				continue;
+
+			RewindAuditMix(digest, static_cast<uint64_t>(feature->id));
+			RewindAuditMix(digest, static_cast<uint64_t>(feature->team));
+			RewindAuditMix(digest, static_cast<uint64_t>((feature->def != nullptr) ? feature->def->id : -1));
+			RewindAuditMix(digest, RewindAuditFloatBits(feature->pos.x));
+			RewindAuditMix(digest, RewindAuditFloatBits(feature->pos.y));
+			RewindAuditMix(digest, RewindAuditFloatBits(feature->pos.z));
+			RewindAuditMix(digest, RewindAuditFloatBits(feature->health));
+			RewindAuditMix(digest, RewindAuditFloatBits(feature->reclaimLeft));
+			RewindAuditMix(digest, RewindAuditFloatBits(feature->resurrectProgress));
+			RewindAuditMix(digest, RewindAuditFloatBits(feature->resources.metal));
+			RewindAuditMix(digest, RewindAuditFloatBits(feature->resources.energy));
+		}
+
+		return digest;
+	}
+
+	struct RewindAuditWeaponSnapshot {
+		int unitId = -1;
+		int weaponIndex = -1;
+		int targetType = Target_None;
+		int targetUnitId = -1;
+		int targetProjectileId = -1;
+		bool targetIsUser = false;
+		bool targetIsAuto = false;
+		bool targetIsManual = false;
+		int aimFromPiece = -1;
+		int muzzlePiece = -1;
+		int reloadStatus = 0;
+		int nextSalvo = 0;
+		int salvoLeft = 0;
+		int lastAimedFrame = 0;
+		float3 relAimFromPos;
+		float3 aimFromPos;
+		float3 relWeaponMuzzlePos;
+		float3 weaponMuzzlePos;
+		float3 weaponDir;
+		float3 wantedDir;
+		float3 lastRequestedDir;
+		float3 currentTargetPos;
+		float3 salvoError;
+		float3 errorVector;
+		float3 errorVectorAdd;
+		float3 targetGroundPos;
+	};
+
+	static RewindAuditWeaponSnapshot BuildRewindAuditWeaponSnapshot(
+		const CUnit* unit,
+		const CWeapon* weapon,
+		const int weaponIndex
+	) {
+		RewindAuditWeaponSnapshot snapshot;
+		const SWeaponTarget& target = weapon->GetCurrentTarget();
+		snapshot.unitId = unit->id;
+		snapshot.weaponIndex = weaponIndex;
+		snapshot.targetType = target.type;
+		snapshot.targetUnitId = (target.unit != nullptr) ? target.unit->id : -1;
+		snapshot.targetProjectileId = (target.intercept != nullptr) ? target.intercept->id : -1;
+		snapshot.targetIsUser = target.isUserTarget;
+		snapshot.targetIsAuto = target.isAutoTarget;
+		snapshot.targetIsManual = target.isManualFire;
+		snapshot.aimFromPiece = weapon->aimFromPiece;
+		snapshot.muzzlePiece = weapon->muzzlePiece;
+		snapshot.reloadStatus = weapon->reloadStatus;
+		snapshot.nextSalvo = weapon->nextSalvo;
+		snapshot.salvoLeft = weapon->salvoLeft;
+		snapshot.lastAimedFrame = weapon->lastAimedFrame;
+		snapshot.relAimFromPos = weapon->relAimFromPos;
+		snapshot.aimFromPos = weapon->aimFromPos;
+		snapshot.relWeaponMuzzlePos = weapon->relWeaponMuzzlePos;
+		snapshot.weaponMuzzlePos = weapon->weaponMuzzlePos;
+		snapshot.weaponDir = weapon->weaponDir;
+		snapshot.wantedDir = weapon->wantedDir;
+		snapshot.lastRequestedDir = weapon->lastRequestedDir;
+		snapshot.currentTargetPos = weapon->GetCurrentTargetPos();
+		snapshot.salvoError = weapon->salvoError;
+		snapshot.errorVector = weapon->errorVector;
+		snapshot.errorVectorAdd = weapon->errorVectorAdd;
+		snapshot.targetGroundPos = target.groundPos;
+		return snapshot;
+	}
+
+	static bool RewindAuditWeaponSnapshotDiffers(
+		const RewindAuditWeaponSnapshot& reference,
+		const RewindAuditWeaponSnapshot& current
+	) {
+		return (
+			reference.targetType != current.targetType ||
+			reference.targetUnitId != current.targetUnitId ||
+			reference.targetProjectileId != current.targetProjectileId ||
+			reference.targetIsUser != current.targetIsUser ||
+			reference.targetIsAuto != current.targetIsAuto ||
+			reference.targetIsManual != current.targetIsManual ||
+			reference.aimFromPiece != current.aimFromPiece ||
+			reference.muzzlePiece != current.muzzlePiece ||
+			reference.reloadStatus != current.reloadStatus ||
+			reference.nextSalvo != current.nextSalvo ||
+			reference.salvoLeft != current.salvoLeft ||
+			reference.lastAimedFrame != current.lastAimedFrame ||
+			!RewindAuditSameFloat3(reference.relAimFromPos, current.relAimFromPos) ||
+			!RewindAuditSameFloat3(reference.aimFromPos, current.aimFromPos) ||
+			!RewindAuditSameFloat3(reference.relWeaponMuzzlePos, current.relWeaponMuzzlePos) ||
+			!RewindAuditSameFloat3(reference.weaponMuzzlePos, current.weaponMuzzlePos) ||
+			!RewindAuditSameFloat3(reference.weaponDir, current.weaponDir) ||
+			!RewindAuditSameFloat3(reference.wantedDir, current.wantedDir) ||
+			!RewindAuditSameFloat3(reference.lastRequestedDir, current.lastRequestedDir) ||
+			!RewindAuditSameFloat3(reference.currentTargetPos, current.currentTargetPos) ||
+			!RewindAuditSameFloat3(reference.salvoError, current.salvoError) ||
+			!RewindAuditSameFloat3(reference.errorVector, current.errorVector) ||
+			!RewindAuditSameFloat3(reference.errorVectorAdd, current.errorVectorAdd) ||
+			!RewindAuditSameFloat3(reference.targetGroundPos, current.targetGroundPos)
+		);
+	}
+
+	static std::string RewindAuditFormatFloat3Precise(const float3& value)
+	{
+		return fmt::format("{:.9f},{:.9f},{:.9f}", value.x, value.y, value.z);
+	}
+
+	static std::string RewindAuditFormatWeaponSnapshot(const RewindAuditWeaponSnapshot& snapshot)
+	{
+		return fmt::format(
+			"unit={} weapon={} targetType={} targetUnit={} targetProjectile={} targetUser={} targetAuto={} targetManual={} targetGround=[{}] aimPiece={} muzzlePiece={} reload={} nextSalvo={} salvoLeft={} lastAim={} relAim=[{}] aim=[{}] relMuzzle=[{}] muzzle=[{}] dir=[{}] wanted=[{}] requested=[{}] target=[{}] salvoError=[{}] error=[{}] errorAdd=[{}]",
+			snapshot.unitId,
+			snapshot.weaponIndex,
+			snapshot.targetType,
+			snapshot.targetUnitId,
+			snapshot.targetProjectileId,
+			int(snapshot.targetIsUser),
+			int(snapshot.targetIsAuto),
+			int(snapshot.targetIsManual),
+			RewindAuditFormatFloat3Precise(snapshot.targetGroundPos),
+			snapshot.aimFromPiece,
+			snapshot.muzzlePiece,
+			snapshot.reloadStatus,
+			snapshot.nextSalvo,
+			snapshot.salvoLeft,
+			snapshot.lastAimedFrame,
+			RewindAuditFormatFloat3Precise(snapshot.relAimFromPos),
+			RewindAuditFormatFloat3Precise(snapshot.aimFromPos),
+			RewindAuditFormatFloat3Precise(snapshot.relWeaponMuzzlePos),
+			RewindAuditFormatFloat3Precise(snapshot.weaponMuzzlePos),
+			RewindAuditFormatFloat3Precise(snapshot.weaponDir),
+			RewindAuditFormatFloat3Precise(snapshot.wantedDir),
+			RewindAuditFormatFloat3Precise(snapshot.lastRequestedDir),
+			RewindAuditFormatFloat3Precise(snapshot.currentTargetPos),
+			RewindAuditFormatFloat3Precise(snapshot.salvoError),
+			RewindAuditFormatFloat3Precise(snapshot.errorVector),
+			RewindAuditFormatFloat3Precise(snapshot.errorVectorAdd)
+		);
+	}
+
+	static void CompareOrStoreRewindAuditWeaponSnapshots(
+		const int frameNum,
+		const std::vector<const CUnit*>& units
+	) {
+		static std::unordered_map<int, std::vector<RewindAuditWeaponSnapshot>> referenceSnapshots;
+		std::vector<RewindAuditWeaponSnapshot> currentSnapshots;
+
+		for (const CUnit* unit: units) {
+			for (std::size_t weaponIndex = 0; weaponIndex < unit->weapons.size(); ++weaponIndex) {
+				const CWeapon* weapon = unit->weapons[weaponIndex];
+				if (weapon != nullptr)
+					currentSnapshots.emplace_back(BuildRewindAuditWeaponSnapshot(unit, weapon, weaponIndex));
+			}
+		}
+
+		const auto refIt = referenceSnapshots.find(frameNum);
+		if (refIt == referenceSnapshots.end()) {
+			referenceSnapshots.emplace(frameNum, std::move(currentSnapshots));
+			return;
+		}
+
+		const auto& reference = refIt->second;
+		const std::size_t maxSize = std::max(reference.size(), currentSnapshots.size());
+		unsigned int totalDiffs = 0;
+		unsigned int loggedDiffs = 0;
+		constexpr unsigned int maxLoggedDiffs = 12;
+
+		for (std::size_t i = 0; i < maxSize; ++i) {
+			const bool haveReference = (i < reference.size());
+			const bool haveCurrent = (i < currentSnapshots.size());
+			const bool differs = (
+				haveReference != haveCurrent ||
+				(
+					haveReference &&
+					haveCurrent &&
+					(
+						reference[i].unitId != currentSnapshots[i].unitId ||
+						reference[i].weaponIndex != currentSnapshots[i].weaponIndex ||
+						RewindAuditWeaponSnapshotDiffers(reference[i], currentSnapshots[i])
+					)
+				)
+			);
+
+			if (!differs)
+				continue;
+
+			totalDiffs += 1;
+			if (loggedDiffs >= maxLoggedDiffs)
+				continue;
+
+			const auto ref = haveReference ? reference[i] : RewindAuditWeaponSnapshot{};
+			const auto cur = haveCurrent ? currentSnapshots[i] : RewindAuditWeaponSnapshot{};
+			AppendRewindAuditLine(fmt::format(
+				"weapon-detail frame={} index={} reference=[present={} {}] current=[present={} {}]",
+				frameNum,
+				i,
+				int(haveReference),
+				RewindAuditFormatWeaponSnapshot(ref),
+				int(haveCurrent),
+				RewindAuditFormatWeaponSnapshot(cur)
+			));
+			loggedDiffs += 1;
+		}
+
+		if (totalDiffs > 0) {
+			AppendRewindAuditLine(fmt::format(
+				"weapon-detail-summary frame={} differingWeapons={} logged={} referenceSize={} currentSize={}",
+				frameNum,
+				totalDiffs,
+				loggedDiffs,
+				reference.size(),
+				currentSnapshots.size()
+			));
+		}
+	}
+
+	static uint64_t BuildRewindAuditProjectileDigest(unsigned int& activeProjectiles)
+	{
+		std::vector<const CProjectile*> projectiles;
+		projectiles.reserve(projectileHandler.GetActiveProjectiles(true).size());
+
+		for (const CProjectile* projectile: projectileHandler.GetActiveProjectiles(true)) {
+			if (projectile != nullptr)
+				projectiles.push_back(projectile);
+		}
+
+		std::sort(projectiles.begin(), projectiles.end(), [](const CProjectile* a, const CProjectile* b) {
+			return (a->id < b->id);
+		});
+
+		activeProjectiles = static_cast<unsigned int>(projectiles.size());
+
+		uint64_t digest = 1469598103934665603ull;
+		for (const CProjectile* projectile: projectiles) {
+			RewindAuditMix(digest, static_cast<uint64_t>(projectile->id));
+			RewindAuditMix(digest, static_cast<uint64_t>(projectile->GetProjectileType()));
+			RewindAuditMix(digest, static_cast<uint64_t>(projectile->GetOwnerID()));
+			RewindAuditMix(digest, static_cast<uint64_t>(projectile->GetTeamID()));
+			RewindAuditMix(digest, static_cast<uint64_t>(projectile->createMe));
+			RewindAuditMix(digest, static_cast<uint64_t>(projectile->deleteMe));
+			RewindAuditMix(digest, static_cast<uint64_t>(projectile->checkCol));
+			RewindAuditMix(digest, RewindAuditFloatBits(projectile->pos.x));
+			RewindAuditMix(digest, RewindAuditFloatBits(projectile->pos.y));
+			RewindAuditMix(digest, RewindAuditFloatBits(projectile->pos.z));
+			RewindAuditMix(digest, RewindAuditFloatBits(projectile->speed.x));
+			RewindAuditMix(digest, RewindAuditFloatBits(projectile->speed.y));
+			RewindAuditMix(digest, RewindAuditFloatBits(projectile->speed.z));
+		}
+
+		return digest;
+	}
+
+	struct RewindAuditProjectileSnapshot {
+		int id = -1;
+		uint32_t type = 0;
+		uint32_t owner = 0;
+		uint32_t team = 0;
+		bool createMe = false;
+		bool deleteMe = false;
+		bool checkCol = false;
+		float3 pos;
+		float3 speed;
+	};
+
+	static RewindAuditProjectileSnapshot BuildRewindAuditProjectileSnapshot(const CProjectile* projectile)
+	{
+		RewindAuditProjectileSnapshot snapshot;
+		snapshot.id = projectile->id;
+		snapshot.type = projectile->GetProjectileType();
+		snapshot.owner = projectile->GetOwnerID();
+		snapshot.team = projectile->GetTeamID();
+		snapshot.createMe = projectile->createMe;
+		snapshot.deleteMe = projectile->deleteMe;
+		snapshot.checkCol = projectile->checkCol;
+		snapshot.pos = projectile->pos;
+		snapshot.speed = projectile->speed;
+		return snapshot;
+	}
+
+	static bool RewindAuditProjectileSnapshotDiffers(
+		const RewindAuditProjectileSnapshot& reference,
+		const RewindAuditProjectileSnapshot& current
+	) {
+		return (
+			reference.type != current.type ||
+			reference.owner != current.owner ||
+			reference.team != current.team ||
+			reference.createMe != current.createMe ||
+			reference.deleteMe != current.deleteMe ||
+			reference.checkCol != current.checkCol ||
+			!RewindAuditSameFloat3(reference.pos, current.pos) ||
+			!RewindAuditSameFloat3(reference.speed, current.speed)
+		);
+	}
+
+	static std::string RewindAuditFormatProjectileSnapshot(const RewindAuditProjectileSnapshot& snapshot)
+	{
+		return fmt::format(
+			"id={} type={} owner={} team={} create={} delete={} checkCol={} pos={} speed={}",
+			snapshot.id,
+			snapshot.type,
+			snapshot.owner,
+			snapshot.team,
+			int(snapshot.createMe),
+			int(snapshot.deleteMe),
+			int(snapshot.checkCol),
+			RewindAuditFormatFloat3(snapshot.pos),
+			RewindAuditFormatFloat3(snapshot.speed)
+		);
+	}
+
+	static void CompareOrStoreRewindAuditProjectileSnapshots(const int frameNum)
+	{
+		static std::unordered_map<int, std::vector<RewindAuditProjectileSnapshot>> referenceSnapshots;
+		std::vector<RewindAuditProjectileSnapshot> currentSnapshots;
+
+		for (const CProjectile* projectile: projectileHandler.GetActiveProjectiles(true)) {
+			if (projectile != nullptr)
+				currentSnapshots.emplace_back(BuildRewindAuditProjectileSnapshot(projectile));
+		}
+
+		std::sort(currentSnapshots.begin(), currentSnapshots.end(), [](const auto& a, const auto& b) {
+			return (a.id < b.id);
+		});
+
+		const auto refIt = referenceSnapshots.find(frameNum);
+		if (refIt == referenceSnapshots.end()) {
+			referenceSnapshots.emplace(frameNum, std::move(currentSnapshots));
+			return;
+		}
+
+		const auto& reference = refIt->second;
+		std::size_t refIdx = 0;
+		std::size_t curIdx = 0;
+		unsigned int loggedDiffs = 0;
+		unsigned int totalDiffs = 0;
+		constexpr unsigned int maxLoggedDiffs = 12;
+
+		while (refIdx < reference.size() || curIdx < currentSnapshots.size()) {
+			const auto* ref = (refIdx < reference.size()) ? &reference[refIdx] : nullptr;
+			const auto* cur = (curIdx < currentSnapshots.size()) ? &currentSnapshots[curIdx] : nullptr;
+
+			if (ref != nullptr && cur != nullptr && ref->id == cur->id) {
+				if (RewindAuditProjectileSnapshotDiffers(*ref, *cur)) {
+					totalDiffs += 1;
+					if (loggedDiffs < maxLoggedDiffs) {
+						AppendRewindAuditLine(fmt::format(
+							"projectile-detail frame={} projectile={} reference=\"{}\" current=\"{}\"",
+							frameNum,
+							ref->id,
+							RewindAuditFormatProjectileSnapshot(*ref),
+							RewindAuditFormatProjectileSnapshot(*cur)
+						));
+						loggedDiffs += 1;
+					}
+				}
+				refIdx += 1;
+				curIdx += 1;
+				continue;
+			}
+
+			if (cur == nullptr || (ref != nullptr && ref->id < cur->id)) {
+				totalDiffs += 1;
+				if (loggedDiffs < maxLoggedDiffs) {
+					AppendRewindAuditLine(fmt::format(
+						"projectile-detail frame={} missing-current projectile={} reference=\"{}\"",
+						frameNum,
+						ref->id,
+						RewindAuditFormatProjectileSnapshot(*ref)
+					));
+					loggedDiffs += 1;
+				}
+				refIdx += 1;
+				continue;
+			}
+
+			totalDiffs += 1;
+			if (loggedDiffs < maxLoggedDiffs) {
+				AppendRewindAuditLine(fmt::format(
+					"projectile-detail frame={} missing-reference projectile={} current=\"{}\"",
+					frameNum,
+					cur->id,
+					RewindAuditFormatProjectileSnapshot(*cur)
+				));
+				loggedDiffs += 1;
+			}
+			curIdx += 1;
+		}
+
+		if (totalDiffs > 0) {
+			AppendRewindAuditLine(fmt::format(
+				"projectile-detail-summary frame={} differingProjectiles={} logged={}",
+				frameNum,
+				totalDiffs,
+				loggedDiffs
+			));
+		}
+	}
+
+	template <typename Component>
+	static uint64_t BuildRewindAuditEcsOrderDigest()
+	{
+		uint64_t digest = 1469598103934665603ull;
+		auto view = Sim::registry.view<Component>();
+
+		RewindAuditMix(digest, static_cast<uint64_t>(view.size()));
+		for (std::size_t i = 0; i < view.size(); ++i) {
+			const entt::entity entity = view.template storage<Component>()[i];
+			const Component& component = view.template get<Component>(entity);
+
+			RewindAuditMix(digest, static_cast<uint64_t>(entt::to_integral(entity)));
+
+			if constexpr (requires { component.value; }) {
+				if constexpr (std::is_integral_v<std::decay_t<decltype(component.value)>>) {
+					RewindAuditMix(digest, static_cast<uint64_t>(component.value));
+				} else {
+					RewindAuditMix(digest, static_cast<uint64_t>(component.value.size()));
+				}
+			} else if constexpr (std::is_same_v<Component, MoveTypes::UnitTrapCheck>) {
+				RewindAuditMix(digest, static_cast<uint64_t>(component.type));
+				RewindAuditMix(digest, static_cast<uint64_t>(component.id));
+			} else if constexpr (std::is_same_v<Component, MoveTypes::UnitMovedEvent>) {
+				RewindAuditMix(digest, static_cast<uint64_t>(component.unitId));
+				RewindAuditMix(digest, static_cast<uint64_t>(component.moved));
+			} else if constexpr (std::is_same_v<Component, MoveTypes::ChangeHeadingEvent>) {
+				RewindAuditMix(digest, static_cast<uint64_t>(component.unitId));
+				RewindAuditMix(digest, static_cast<uint64_t>(component.deltaHeading));
+				RewindAuditMix(digest, static_cast<uint64_t>(component.changed));
+			} else if constexpr (std::is_same_v<Component, MoveTypes::ChangeMainHeadingEvent>) {
+				RewindAuditMix(digest, static_cast<uint64_t>(component.unitId));
+				RewindAuditMix(digest, static_cast<uint64_t>(component.changed));
+			}
+		}
+
+		return digest;
+	}
+
+	template <typename Component>
+	static uint64_t BuildRewindAuditEcsEntityOrderDigest()
+	{
+		uint64_t digest = 1469598103934665603ull;
+		auto view = Sim::registry.view<Component>();
+
+		RewindAuditMix(digest, static_cast<uint64_t>(view.size()));
+		for (std::size_t i = 0; i < view.size(); ++i) {
+			RewindAuditMix(
+				digest,
+				static_cast<uint64_t>(entt::to_integral(view.template storage<Component>()[i]))
+			);
+		}
+
+		return digest;
+	}
+
+	static uint64_t BuildRewindAuditChangeHeadingValueDigest()
+	{
+		uint64_t digest = 1469598103934665603ull;
+		auto view = Sim::registry.view<MoveTypes::ChangeHeadingEvent>();
+
+		RewindAuditMix(digest, static_cast<uint64_t>(view.size()));
+		for (std::size_t i = 0; i < view.size(); ++i) {
+			const entt::entity entity = view.storage<MoveTypes::ChangeHeadingEvent>()[i];
+			const auto& component = view.get<MoveTypes::ChangeHeadingEvent>(entity);
+
+			RewindAuditMix(digest, static_cast<uint64_t>(component.unitId));
+			RewindAuditMix(digest, static_cast<uint64_t>(component.deltaHeading));
+			RewindAuditMix(digest, static_cast<uint64_t>(component.changed));
+		}
+
+		return digest;
+	}
+
+	struct RewindAuditChangeHeadingSnapshot {
+		uint32_t entity = 0;
+		int unitId = -1;
+		short deltaHeading = 0;
+		bool changed = false;
+	};
+
+	static void CompareOrStoreRewindAuditChangeHeadingSnapshots(const int frameNum)
+	{
+		static std::unordered_map<int, std::vector<RewindAuditChangeHeadingSnapshot>> referenceSnapshots;
+
+		auto view = Sim::registry.view<MoveTypes::ChangeHeadingEvent>();
+		std::vector<RewindAuditChangeHeadingSnapshot> currentSnapshots;
+		currentSnapshots.reserve(view.size());
+
+		for (std::size_t i = 0; i < view.size(); ++i) {
+			const entt::entity entity = view.storage<MoveTypes::ChangeHeadingEvent>()[i];
+			const auto& component = view.get<MoveTypes::ChangeHeadingEvent>(entity);
+			currentSnapshots.push_back({
+				static_cast<uint32_t>(entt::to_integral(entity)),
+				component.unitId,
+				component.deltaHeading,
+				component.changed
+			});
+		}
+
+		const auto refIt = referenceSnapshots.find(frameNum);
+		if (refIt == referenceSnapshots.end()) {
+			referenceSnapshots.emplace(frameNum, std::move(currentSnapshots));
+			return;
+		}
+
+		const auto& reference = refIt->second;
+		const std::size_t maxSize = std::max(reference.size(), currentSnapshots.size());
+		unsigned int totalDiffs = 0;
+		unsigned int loggedDiffs = 0;
+		constexpr unsigned int maxLoggedDiffs = 12;
+
+		for (std::size_t i = 0; i < maxSize; ++i) {
+			const bool haveReference = (i < reference.size());
+			const bool haveCurrent = (i < currentSnapshots.size());
+			const bool differs = (
+				haveReference != haveCurrent ||
+				(
+					haveReference &&
+					haveCurrent &&
+					(
+						reference[i].entity != currentSnapshots[i].entity ||
+						reference[i].unitId != currentSnapshots[i].unitId ||
+						reference[i].deltaHeading != currentSnapshots[i].deltaHeading ||
+						reference[i].changed != currentSnapshots[i].changed
+					)
+				)
+			);
+
+			if (!differs)
+				continue;
+
+			totalDiffs += 1;
+			if (loggedDiffs >= maxLoggedDiffs)
+				continue;
+
+			const auto ref = haveReference ? reference[i] : RewindAuditChangeHeadingSnapshot{};
+			const auto cur = haveCurrent ? currentSnapshots[i] : RewindAuditChangeHeadingSnapshot{};
+			AppendRewindAuditLine(fmt::format(
+				"heading-detail frame={} index={} reference=[present={} entity={} unit={} delta={} changed={}] current=[present={} entity={} unit={} delta={} changed={}]",
+				frameNum,
+				i,
+				int(haveReference),
+				ref.entity,
+				ref.unitId,
+				ref.deltaHeading,
+				int(ref.changed),
+				int(haveCurrent),
+				cur.entity,
+				cur.unitId,
+				cur.deltaHeading,
+				int(cur.changed)
+			));
+			loggedDiffs += 1;
+		}
+
+		if (totalDiffs > 0) {
+			AppendRewindAuditLine(fmt::format(
+				"heading-detail-summary frame={} differingEntries={} logged={} referenceSize={} currentSize={}",
+				frameNum,
+				totalDiffs,
+				loggedDiffs,
+				reference.size(),
+				currentSnapshots.size()
+			));
+		}
+	}
+
+	static void WriteRewindAuditSnapshot(const int frameNum)
+	{
+		if (!ShouldWriteRewindAuditFrame(frameNum))
+			return;
+
+		const int2 queuedPathUpdates = pathManager->GetNumQueuedUpdates();
+		const std::vector<const CUnit*> units = GetSortedRewindAuditUnits();
+		unsigned int activeFeatures = 0;
+		unsigned int activeProjectiles = 0;
+
+		const uint64_t teamDigest = BuildRewindAuditTeamDigest();
+		const uint64_t commandDigest = BuildRewindAuditCommandDigest(units);
+		const RewindAuditUnitDigests unitDigests = BuildRewindAuditUnitDigests(units);
+		const uint64_t featureDigest = BuildRewindAuditFeatureDigest(activeFeatures);
+		const uint64_t projectileDigest = BuildRewindAuditProjectileDigest(activeProjectiles);
+		const uint64_t generalMoveOrderDigest = BuildRewindAuditEcsOrderDigest<MoveTypes::GeneralMoveType>();
+		const uint64_t groundMoveOrderDigest = BuildRewindAuditEcsOrderDigest<MoveTypes::GroundMoveType>();
+		const uint64_t unitTrapOrderDigest = BuildRewindAuditEcsOrderDigest<MoveTypes::UnitTrapCheck>();
+		const uint64_t unitMovedOrderDigest = BuildRewindAuditEcsOrderDigest<MoveTypes::UnitMovedEvent>();
+		const uint64_t changeHeadingOrderDigest = BuildRewindAuditEcsOrderDigest<MoveTypes::ChangeHeadingEvent>();
+		const uint64_t changeMainHeadingOrderDigest = BuildRewindAuditEcsOrderDigest<MoveTypes::ChangeMainHeadingEvent>();
+		const uint64_t changeHeadingEntityOrderDigest = BuildRewindAuditEcsEntityOrderDigest<MoveTypes::ChangeHeadingEvent>();
+		const uint64_t changeHeadingValueDigest = BuildRewindAuditChangeHeadingValueDigest();
+
+		AppendRewindAuditLine(fmt::format(
+			"frame={} time={} pathChecksum={} queuedPathUpdates={},{} rngInit={} rngLast={} rngState={} teamDigest={} commandDigest={} unitDigest={} unitIdentityDigest={} unitKinematicsDigest={} unitMoveDigest={} unitIDPoolDigest={} featureDigest={} projectileDigest={} generalMoveOrderDigest={} groundMoveOrderDigest={} unitTrapOrderDigest={} unitMovedOrderDigest={} changeHeadingOrderDigest={} changeMainHeadingOrderDigest={} changeHeadingEntityOrderDigest={} changeHeadingValueDigest={} activeTeams={} activeUnits={} activeFeatures={} activeProjectiles={}",
+			frameNum,
+			FormatReplayTime(frameNum / GAME_SPEED),
+			pathManager->GetPathCheckSum(),
+			queuedPathUpdates.x,
+			queuedPathUpdates.y,
+			static_cast<unsigned long long>(gsRNG.GetInitSeed()),
+			static_cast<unsigned long long>(gsRNG.GetLastSeed()),
+			static_cast<unsigned long long>(gsRNG.GetGenState()),
+			static_cast<unsigned long long>(teamDigest),
+			static_cast<unsigned long long>(commandDigest),
+			static_cast<unsigned long long>(unitDigests.combinedDigest),
+			static_cast<unsigned long long>(unitDigests.identityDigest),
+			static_cast<unsigned long long>(unitDigests.kinematicsDigest),
+			static_cast<unsigned long long>(unitDigests.moveDigest),
+			static_cast<unsigned long long>(unitHandler.GetIDPoolDebugDigest()),
+			static_cast<unsigned long long>(featureDigest),
+			static_cast<unsigned long long>(projectileDigest),
+			static_cast<unsigned long long>(generalMoveOrderDigest),
+			static_cast<unsigned long long>(groundMoveOrderDigest),
+			static_cast<unsigned long long>(unitTrapOrderDigest),
+			static_cast<unsigned long long>(unitMovedOrderDigest),
+			static_cast<unsigned long long>(changeHeadingOrderDigest),
+			static_cast<unsigned long long>(changeMainHeadingOrderDigest),
+			static_cast<unsigned long long>(changeHeadingEntityOrderDigest),
+			static_cast<unsigned long long>(changeHeadingValueDigest),
+			teamHandler.ActiveTeams(),
+			units.size(),
+			activeFeatures,
+			activeProjectiles
+		));
+
+		CompareOrStoreRewindAuditUnitSnapshots(frameNum, units);
+		CompareOrStoreRewindAuditWeaponSnapshots(frameNum, units);
+		CompareOrStoreRewindAuditChangeHeadingSnapshots(frameNum);
+		CompareOrStoreRewindAuditProjectileSnapshots(frameNum);
+	}
+
+	struct RewindSimPhaseDigest {
+		uint64_t rng = 0;
+		uint64_t teams = 0;
+		uint64_t commands = 0;
+		uint64_t units = 0;
+		uint64_t features = 0;
+		uint64_t projectiles = 0;
+		uint64_t paths = 0;
+	};
+
+	static RewindSimPhaseDigest BuildRewindSimPhaseDigest()
+	{
+		const std::vector<const CUnit*> units = GetSortedRewindAuditUnits();
+		const RewindAuditUnitDigests unitDigests = BuildRewindAuditUnitDigests(units);
+		unsigned int activeFeatures = 0;
+		unsigned int activeProjectiles = 0;
+
+		RewindSimPhaseDigest digest;
+		digest.rng = static_cast<uint64_t>(gsRNG.GetGenState());
+		digest.teams = BuildRewindAuditTeamDigest();
+		digest.commands = BuildRewindAuditCommandDigest(units);
+		digest.units = unitDigests.combinedDigest;
+		digest.features = BuildRewindAuditFeatureDigest(activeFeatures);
+		digest.projectiles = BuildRewindAuditProjectileDigest(activeProjectiles);
+		digest.paths = static_cast<uint64_t>(pathManager->GetPathCheckSum());
+		RewindAuditMix(digest.paths, static_cast<uint64_t>(pathManager->GetNumQueuedUpdates().x));
+		RewindAuditMix(digest.paths, static_cast<uint64_t>(pathManager->GetNumQueuedUpdates().y));
+		return digest;
+	}
+
+	static void AuditRewindSimPhase(const unsigned int phase, const char* phaseName)
+	{
+		if (!GetRewindAuditSettings().enabled)
+			return;
+
+		static std::unordered_map<uint64_t, RewindSimPhaseDigest> references;
+		static int firstDivergentFrame = -1;
+
+		const uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(gs->frameNum)) << 8) | phase;
+		const RewindSimPhaseDigest current = BuildRewindSimPhaseDigest();
+		const auto [it, inserted] = references.emplace(key, current);
+		if (inserted)
+			return;
+
+		const RewindSimPhaseDigest& reference = it->second;
+		const bool differs = (
+			reference.rng != current.rng ||
+			reference.teams != current.teams ||
+			reference.commands != current.commands ||
+			reference.units != current.units ||
+			reference.features != current.features ||
+			reference.projectiles != current.projectiles ||
+			reference.paths != current.paths
+		);
+		if (!differs)
+			return;
+
+		if (firstDivergentFrame < 0)
+			firstDivergentFrame = gs->frameNum;
+		if (gs->frameNum > firstDivergentFrame)
+			return;
+
+		LOG(
+			"[RewindSimPhaseAudit] frame=%d phase=%s rng=%llu/%llu teams=%llu/%llu commands=%llu/%llu units=%llu/%llu features=%llu/%llu projectiles=%llu/%llu paths=%llu/%llu",
+			gs->frameNum,
+			phaseName,
+			static_cast<unsigned long long>(reference.rng),
+			static_cast<unsigned long long>(current.rng),
+			static_cast<unsigned long long>(reference.teams),
+			static_cast<unsigned long long>(current.teams),
+			static_cast<unsigned long long>(reference.commands),
+			static_cast<unsigned long long>(current.commands),
+			static_cast<unsigned long long>(reference.units),
+			static_cast<unsigned long long>(current.units),
+			static_cast<unsigned long long>(reference.features),
+			static_cast<unsigned long long>(current.features),
+			static_cast<unsigned long long>(reference.projectiles),
+			static_cast<unsigned long long>(current.projectiles),
+			static_cast<unsigned long long>(reference.paths),
+			static_cast<unsigned long long>(current.paths)
+		);
+	}
+}
 
 CONFIG(bool, GameEndOnConnectionLoss).defaultValue(true);
 // CONFIG(bool, LuaCollectGarbageOnSimFrame).defaultValue(true);
@@ -150,6 +1549,11 @@ CONFIG(float, GuiOpacity).defaultValue(0.8f).minimumValue(0.0f).maximumValue(1.0
 CONFIG(std::string, InputTextGeo).defaultValue("");
 
 CONFIG(int, SmoothTimeOffset).defaultValue(0).headlessValue(0).description("Enables frametimeoffset smoothing, 0 = off (old version), -1 = forced 0.5,  1-20 smooth, recommended = 2-3");
+CONFIG(bool, RewindAudit).defaultValue(false).description("Enables read-only BAR Rewind audit digests for replay comparison. Writes local files only and never modifies replay files.");
+CONFIG(std::string, RewindAuditLabel).defaultValue("audit").description("Output label for BAR Rewind audit logs.");
+CONFIG(std::string, RewindAuditFrames).defaultValue("").description("Optional BAR Rewind audit frame list. Accepts frames and mm:ss/hh:mm:ss tokens separated by commas, spaces, or semicolons.");
+CONFIG(int, RewindAuditPeriod).defaultValue(900).minimumValue(0).description("BAR Rewind audit period in frames when RewindAudit is enabled. Zero disables periodic snapshots.");
+CONFIG(bool, ReplayAutoCheckpoints).defaultValue(true).description("Enables automatic replay rewind checkpoints during replay playback.");
 
 CGame* game = nullptr;
 
@@ -459,6 +1863,7 @@ void CGame::Load(const std::string& mapFileName)
 
 		if (!globalQuit && saveFileHandler != nullptr) {
 			loadscreen->SetLoadMessage("Loading Saved Game");
+			ActivatePendingReplayResumeRequest();
 			{
 				auto lock = CLoadLock::GetUniqueLock();
 				saveFileHandler->LoadGame();
@@ -483,10 +1888,24 @@ void CGame::Load(const std::string& mapFileName)
 			//needed in case pre-game terraform changed the map
 			readMap->UpdateHeightBounds();
 			Watchdog::ClearTimer(WDT_LOAD);
-			pathManager->PostFinalizeRefresh();
+			bool skipPathPostFinalizeRefresh = false;
+			if (saveFileHandler != nullptr) {
+				if (auto* qtpfsPathManager = dynamic_cast<QTPFS::PathManager*>(pathManager); qtpfsPathManager != nullptr) {
+					skipPathPostFinalizeRefresh = qtpfsPathManager->ConsumeLoadSavePostLoadRefreshSkip();
+				}
+			}
+
+			if (skipPathPostFinalizeRefresh) {
+				LOG("[Game::%s] skipping post-load QTPFS refresh because a full rewind path snapshot was restored", __func__);
+			} else {
+				pathManager->PostFinalizeRefresh();
+			}
 			Watchdog::ClearTimer(WDT_LOAD);
 			LEAVE_SYNCED_CODE();
 		}
+
+		if (saveFileHandler != nullptr)
+			ActivatePendingReplayResumeRequest();
 
 		{
 			char msgBuf[512];
@@ -933,13 +2352,121 @@ void CGame::LoadFinalize()
 
 void CGame::PostLoad()
 {
+	// The LoadSave handler runs finalization after all embedded Rewind collectors
+	// have loaded. Running it here is too early for queued QTPFS and net restores.
+}
+
+
+void CGame::FinalizeLoadSavePostLoad()
+{
 	RECOIL_DETAILED_TRACY_ZONE;
 	GameSetupDrawer::Disable();
+
+	// Reapply only the local unsynced player view. Do not recompute every
+	// player's controlledTeams here; the replay checkpoint restored the exact
+	// per-player control masks from the save and command playback depends on
+	// those masks staying identical to the captured frame.
+	if (playerHandler.IsValidPlayer(gu->myPlayerNum)) {
+		gu->SetMyPlayer(gu->myPlayerNum);
+	}
+
+	// LOS, radar, sonar, and jammer maps are derived runtime state and are not
+	// serialized by CREG. Rebuild them before the first resumed simulation frame
+	// so Unit::UpdateLosStatus sees the same sensor coverage as an uninterrupted
+	// replay instead of one frame of empty maps.
+	if (losHandler != nullptr) {
+		losHandler->Update();
+		LOG("[Game::%s] rebuilt LOS and sensor maps from restored units", __func__);
+	}
+
+	if (auto* qtpfsPathManager = dynamic_cast<QTPFS::PathManager*>(pathManager); qtpfsPathManager != nullptr) {
+		// Older rewind saves only contain path-level restore data and still need a full graph refresh.
+		// Newer saves can queue a complete QTPFS node-layer snapshot and should apply it directly.
+		if (!qtpfsPathManager->HasQueuedFullLoadSaveState()) {
+			LOG("[Game::%s] QTPFS full snapshot not present, rebuilding path graph from restored map state", __func__);
+			qtpfsPathManager->TerrainChange(0, 0, mapDims.mapx, mapDims.mapy, 0);
+			qtpfsPathManager->PostFinalizeRefresh();
+		} else {
+			LOG("[Game::%s] QTPFS full snapshot detected, skipping full-map path graph rebuild", __func__);
+		}
+		qtpfsPathManager->ApplyLoadSaveRestore();
+
+		unsigned int rebuiltGroundMovePaths = 0;
+		unsigned int missingGroundMovePaths = 0;
+		unsigned int mismatchedGroundMovePaths = 0;
+		const bool rebuildAllGroundMovePaths = qtpfsPathManager->HadLoadSaveRestoreNodeLayerChecksumMismatch();
+
+		for (CUnit* unit: unitHandler.GetActiveUnits()) {
+			if ((unit == nullptr) || (unit->moveType == nullptr))
+				continue;
+
+			auto* groundMoveType = dynamic_cast<CGroundMoveType*>(unit->moveType);
+			if (groundMoveType == nullptr)
+				continue;
+			const unsigned int groundPathId = groundMoveType->GetPathID();
+			const bool hasAnyLiveGroundPath = (groundPathId != 0) && qtpfsPathManager->HasLivePath(groundPathId, true);
+			const bool hasCompatibleLiveGroundPath = (groundPathId != 0) && qtpfsPathManager->HasCompatibleLivePath(groundPathId, unit, true);
+			const bool forcePathRebuild = rebuildAllGroundMovePaths || ((groundPathId != 0) && !hasCompatibleLiveGroundPath);
+
+			if (!forcePathRebuild && !groundMoveType->NeedsLoadSavePathReinit())
+				continue;
+			if (!forcePathRebuild && hasCompatibleLiveGroundPath)
+				continue;
+
+			missingGroundMovePaths += (!hasAnyLiveGroundPath);
+			mismatchedGroundMovePaths += (hasAnyLiveGroundPath && !hasCompatibleLiveGroundPath);
+			groundMoveType->RebuildPathAfterLoadSaveRestore(forcePathRebuild);
+			rebuiltGroundMovePaths += 1;
+		}
+
+		if (rebuiltGroundMovePaths > 0 || qtpfsPathManager->NeedsLoadSaveGroundPathRebuild() || rebuildAllGroundMovePaths) {
+			LOG("[Game::%s] rebuilt %u active ground-unit paths after QTPFS rewind restore (missingPathIds=%u mismatchedPathOwners=%u rebuildAll=%d)",
+				__func__,
+				rebuiltGroundMovePaths,
+				missingGroundMovePaths,
+				mismatchedGroundMovePaths,
+				int(rebuildAllGroundMovePaths)
+			);
+		}
+	}
 
 	Sim::systemUtils.NotifyPostLoad();
 
 	if (gameServer != nullptr) {
 		gameServer->PostLoad(gs->frameNum);
+	}
+
+	netcode::CLocalConnection::ApplyPendingRestore();
+
+	unsigned int restoredSyncChecksum = 0;
+	if (cregLoadSave::ApplyPendingSyncChecksumRestore(restoredSyncChecksum)) {
+		netcode::RestoreLocalSyncChecksum(gs->frameNum, restoredSyncChecksum);
+		LOG(
+			"[Game::%s] restored sync checksum %08x for checkpoint frame %d",
+			__func__,
+			restoredSyncChecksum,
+			gs->frameNum
+		);
+	}
+
+	if (saveFileHandler != nullptr && gameSetup != nullptr && gameSetup->replayCheckpoint && pendingReplayResumeSkip) {
+		pendingReplayResumeSkip = false;
+
+		if (gameServer != nullptr && pendingReplayResumeTargetFrame > gs->frameNum) {
+			LOG(
+				"[ReplayRewind] Resuming replay from checkpoint and skipping to %s after load finalization",
+				FormatReplayTime(static_cast<int>(pendingReplayResumeTargetTime + 0.5f)).c_str()
+			);
+			gameServer->SkipToReplayFrame(pendingReplayResumeTargetFrame);
+		} else if (pendingReplayResumeTargetTime >= 0.0f) {
+			LOG(
+				"[ReplayRewind] Replay restored to %s",
+				FormatReplayTime(static_cast<int>(pendingReplayResumeTargetTime + 0.5f)).c_str()
+			);
+		}
+
+		pendingReplayResumeTargetFrame = -1;
+		pendingReplayResumeTargetTime = -1.0f;
 	}
 }
 
@@ -1353,6 +2880,27 @@ bool CGame::UpdateUnsynced(const spring_time currentTime)
 
 	lastSimFrame = gs->frameNum;
 
+	if (pendingReplayResumeSkip) {
+		pendingReplayResumeSkip = false;
+
+		if (gameServer != nullptr && pendingReplayResumeTargetFrame > gs->frameNum) {
+			LOG(
+				"[ReplayRewind] Resuming replay from checkpoint and skipping to %s",
+				FormatReplayTime(static_cast<int>(pendingReplayResumeTargetTime + 0.5f)).c_str()
+			);
+			CommandMessage msg(Action("skip " + std::to_string(std::max(0, pendingReplayResumeTargetFrame / GAME_SPEED))), gu->myPlayerNum);
+			clientNet->Send(msg.Pack());
+		} else if (pendingReplayResumeTargetTime >= 0.0f) {
+			LOG(
+				"[ReplayRewind] Replay restored to %s",
+				FormatReplayTime(static_cast<int>(pendingReplayResumeTargetTime + 0.5f)).c_str()
+			);
+		}
+
+		pendingReplayResumeTargetFrame = -1;
+		pendingReplayResumeTargetTime = -1.0f;
+	}
+
 	// set camera
 	camHandler->UpdateController(playerHandler.Player(gu->myPlayerNum), gu->fpsMode);
 
@@ -1669,11 +3217,18 @@ void CGame::StartPlaying()
 
 	teamHandler.SetDefaultStartPositions(gameSetup);
 
-	if (saveFileHandler == nullptr)
+	if (saveFileHandler == nullptr) {
 		eventHandler.GameStart();
+		ActivatePendingReplayResumeRequest();
+	}
 }
 
 static const char* const tracingSimFrameName = "SimFrame";
+
+static void LogReplayCompatSyncSnapshot(const int frameNum)
+{
+	WriteRewindAuditSnapshot(frameNum);
+}
 
 void CGame::SimFrame() {
 	ENTER_SYNCED_CODE();
@@ -1720,6 +3275,8 @@ void CGame::SimFrame() {
 	// note: allocator itself should do this (so that
 	// stats are reliable when paused) but see LuaUser
 	spring_lua_alloc_update_stats((gs->frameNum % GAME_SPEED) == 0);
+	LogReplayCompatSyncSnapshot(gs->frameNum);
+	AuditRewindSimPhase(0, "start");
 
 	if (!skipping) {
 		// everything here is unsynced and should ideally moved to Game::Update()
@@ -1747,6 +3304,7 @@ void CGame::SimFrame() {
 		// so we need to save the previous unit state before it happened
 		unitHandler.UpdatePreFrame();
 		featureHandler.UpdatePreFrame();
+		AuditRewindSimPhase(1, "after-pre-frame");
 
 		{
 			SCOPED_TIMER("Sim::GameFrame");
@@ -1758,15 +3316,22 @@ void CGame::SimFrame() {
 
 			eventHandler.GameFrame(gs->frameNum);
 		}
+		AuditRewindSimPhase(2, "after-game-frame");
 
 		helper->Update();
+		AuditRewindSimPhase(3, "after-helper");
 		readMap->Update();
 		smoothGround.UpdateSmoothMesh();
 		mapDamage->Update();
+		AuditRewindSimPhase(4, "after-map");
 		unitHandler.Update();
+		AuditRewindSimPhase(5, "after-units");
 		pathManager->Update();
+		AuditRewindSimPhase(6, "after-paths");
 		projectileHandler.Update();
+		AuditRewindSimPhase(7, "after-projectiles");
 		featureHandler.Update();
+		AuditRewindSimPhase(8, "after-features");
 		{
 			/* The default GAME_SPEED is 30, which doesn't divide 1000 well,
 			 * so scripts will perceive 990ms per second. But this is fine,
@@ -1781,6 +3346,7 @@ void CGame::SimFrame() {
 
 			unitHandler.UpdatePostAnimation();
 		}
+		AuditRewindSimPhase(9, "after-scripts");
 		envResHandler.Update();
 		losHandler->Update();
 		// dead ghosts have to be updated in sim, after los,
@@ -1788,10 +3354,12 @@ void CGame::SimFrame() {
 		// should probably be split from drawer
 		CUnitDrawer::UpdateGhostedBuildings();
 		interceptHandler.Update(false);
+		AuditRewindSimPhase(10, "after-environment");
 
 		teamHandler.GameFrame(gs->frameNum);
 		playerHandler.GameFrame(gs->frameNum);
 		eventHandler.GameFramePost(gs->frameNum);
+		AuditRewindSimPhase(11, "after-frame-post");
 	}
 
 	lastSimFrameTime = spring_gettime();
@@ -1819,6 +3387,8 @@ void CGame::SimFrame() {
 	DumpState(-1, -1, 1, std::nullopt);
 
 	ASSERT_SYNCED(gsRNG.GetGenState());
+	MaybeCreateAutoReplayCheckpoint(true);
+	FlushPendingReplayCheckpointSave();
 	LEAVE_SYNCED_CODE();
 }
 
@@ -2127,6 +3697,249 @@ void CGame::Save(std::string&& fileName, std::string&& saveArgs)
 	RECOIL_DETAILED_TRACY_ZONE;
 	globalSaveFileData.name = std::move(fileName);
 	globalSaveFileData.args = std::move(saveArgs);
+	globalSaveFileData.replayCheckpoint = false;
+	globalSaveFileData.replayCheckpointFrame = -1;
+	globalSaveFileData.replayCheckpointTime = -1.0f;
+	globalSaveFileData.replayCheckpointSchema = 0;
+}
+
+void CGame::SaveReplayCheckpoint(std::string&& fileName, std::string&& saveArgs, int checkpointFrame, float checkpointTime)
+{
+	RECOIL_DETAILED_TRACY_ZONE;
+	if (pendingReplayCheckpointSave) {
+		LOG("[ReplayRewind] A checkpoint request is already waiting for a safe simulation frame");
+		return;
+	}
+
+	pendingReplayCheckpointFileName = std::move(fileName);
+	pendingReplayCheckpointArgs = std::move(saveArgs);
+	pendingReplayCheckpointSave = true;
+	pendingReplayCheckpointIsAuto = false;
+	pendingReplayCheckpointRequestedFrame = checkpointFrame;
+	pendingReplayCheckpointRequestedTime = checkpointTime;
+	pendingReplayCheckpointLastWaitLogFrame = -1;
+}
+
+std::string CGame::GetLocalReplayPlayerName() const
+{
+	if (gu != nullptr && gu->myPlayerNum >= 0) {
+		if (const CPlayer* player = playerHandler.Player(gu->myPlayerNum); player != nullptr) {
+			if (!player->name.empty())
+				return player->name;
+		}
+	}
+
+	return "UnnamedPlayer (spec)";
+}
+
+std::string CGame::BuildReplayCheckpointLoadScript(const std::string& saveRelativePath) const
+{
+	return
+		"[GAME]\n"
+		"{\n"
+		"  IsHost=1;\n"
+		"  MyPlayerName=" + QuoteTdfValue(GetLocalReplayPlayerName()) + ";\n"
+		"  SaveFile=" + QuoteTdfValue(saveRelativePath) + ";\n"
+		"}\n\n";
+}
+
+std::string CGame::BuildReplayStartScript() const
+{
+	if (gameSetup == nullptr || gameSetup->demoName.empty())
+		return "";
+
+	return
+		"[GAME]\n"
+		"{\n"
+		"  IsHost=1;\n"
+		"  MyPlayerName=" + QuoteTdfValue(GetLocalReplayPlayerName()) + ";\n"
+		"  Demofile=" + QuoteTdfValue(gameSetup->demoName) + ";\n"
+		"}\n\n";
+}
+
+bool CGame::QueueReplayReloadScript(std::string&& reloadScript, int targetFrame, float targetTime, bool expectCheckpoint)
+{
+	if (gameSetup == nullptr || gu == nullptr)
+		return false;
+	if (reloadScript.empty())
+		return false;
+	if (!gameSetup->hostDemo)
+		return false;
+
+	replayResumeRequest.active = true;
+	replayResumeRequest.expectCheckpoint = expectCheckpoint;
+	replayResumeRequest.targetFrame = targetFrame;
+	replayResumeRequest.targetTime = targetTime;
+	replayResumeRequest.demoName = gameSetup->demoName;
+
+	gameSetup->reloadScript = std::move(reloadScript);
+	gu->globalReload = true;
+	return true;
+}
+
+bool CGame::QueueReplayResumeFromCheckpoint(const std::string& saveFileName, int targetFrame, float targetTime)
+{
+	return QueueReplayReloadScript(BuildReplayCheckpointLoadScript(saveFileName), targetFrame, targetTime, true);
+}
+
+bool CGame::QueueReplayResumeFromStart(int targetFrame, float targetTime)
+{
+	return QueueReplayReloadScript(BuildReplayStartScript(), targetFrame, targetTime, false);
+}
+
+void CGame::ActivatePendingReplayResumeRequest()
+{
+	if (!replayResumeRequest.active)
+		return;
+
+	const bool demoMatches = (gameSetup != nullptr && gameSetup->demoName == replayResumeRequest.demoName);
+	const bool checkpointStateMatches = (gameSetup != nullptr && gameSetup->replayCheckpoint == replayResumeRequest.expectCheckpoint);
+
+	if (!demoMatches || !checkpointStateMatches) {
+		LOG_L(
+			L_WARNING,
+			"[Game::%s] replay resume request did not match the reloaded session (demoMatches=%d checkpointMatches=%d)",
+			__func__,
+			demoMatches,
+			checkpointStateMatches
+		);
+		replayResumeRequest = {};
+		return;
+	}
+
+	pendingReplayResumeTargetFrame = replayResumeRequest.targetFrame;
+	pendingReplayResumeTargetTime = replayResumeRequest.targetTime;
+	pendingReplayResumeSkip = true;
+
+	replayResumeRequest = {};
+}
+
+void CGame::MaybeCreateAutoReplayCheckpoint(bool newSimFrame)
+{
+	if (!newSimFrame)
+		return;
+	if (gameSetup == nullptr || !gameSetup->hostDemo)
+		return;
+	if (!configHandler->GetBool("ReplayAutoCheckpoints"))
+		return;
+	if (!playing || gameOver)
+		return;
+
+	const int currentSeconds = (gs->frameNum / GAME_SPEED);
+
+	// A reloaded checkpoint starts with a fresh CGame instance. Mark the bucket
+	// containing the restored frame as handled so it is not immediately saved
+	// again on the first simulation frame after loading.
+	if (gameSetup->replayCheckpoint && lastReplayAutoCheckpointBucket < 0) {
+		lastReplayAutoCheckpointBucket =
+			(currentSeconds / replayAutoCheckpointInterval) * replayAutoCheckpointInterval;
+	}
+
+	if (currentSeconds < replayAutoCheckpointInterval)
+		return;
+
+	const int bucket = (currentSeconds / replayAutoCheckpointInterval) * replayAutoCheckpointInterval;
+	if (bucket <= 0 || bucket == lastReplayAutoCheckpointBucket)
+		return;
+
+	lastReplayAutoCheckpointBucket = bucket;
+
+	if (pendingReplayCheckpointSave) {
+		LOG(
+			"[ReplayRewind] Skipped auto-checkpoint at %s because another checkpoint request is still pending",
+			FormatReplayTime(bucket).c_str()
+		);
+		return;
+	}
+
+	if (gameServer == nullptr || !gameServer->IsReplayCheckpointCaptureSafe(gs->frameNum)) {
+		LOG(
+			"[ReplayRewind] Skipped auto-checkpoint at %s because replay data is ahead of the simulation",
+			FormatReplayTime(bucket).c_str()
+		);
+		return;
+	}
+
+	SaveReplayCheckpoint(
+		fmt::format("Saves/rrw_cp_{:06d}.ssf", bucket),
+		"-y",
+		gs->frameNum,
+		static_cast<float>(currentSeconds)
+	);
+	pendingReplayCheckpointIsAuto = true;
+	LOG("[ReplayRewind] Auto-checkpoint requested at %s", FormatReplayTime(bucket).c_str());
+}
+
+void CGame::FlushPendingReplayCheckpointSave()
+{
+	if (!pendingReplayCheckpointSave)
+		return;
+	if (pendingReplayCheckpointFileName.empty()) {
+		pendingReplayCheckpointSave = false;
+		pendingReplayCheckpointIsAuto = false;
+		pendingReplayCheckpointRequestedFrame = -1;
+		pendingReplayCheckpointRequestedTime = -1.0f;
+		pendingReplayCheckpointLastWaitLogFrame = -1;
+		return;
+	}
+
+	if (gameServer == nullptr || !gameServer->IsReplayCheckpointCaptureSafe(gs->frameNum)) {
+		if (pendingReplayCheckpointLastWaitLogFrame < 0 || (gs->frameNum - pendingReplayCheckpointLastWaitLogFrame) >= GAME_SPEED) {
+			LOG("[ReplayRewind] Checkpoint request is waiting for replay network data to align with frame %d", gs->frameNum);
+			pendingReplayCheckpointLastWaitLogFrame = gs->frameNum;
+		}
+		return;
+	}
+
+	unsigned int pendingQTPFSPaths = 0;
+	if (auto* qtpfsPathManager = dynamic_cast<QTPFS::PathManager*>(pathManager); qtpfsPathManager != nullptr)
+		pendingQTPFSPaths = qtpfsPathManager->GetNumPendingLoadSavePaths();
+
+	if (pendingQTPFSPaths > 0) {
+		if (pendingReplayCheckpointLastWaitLogFrame < 0 || (gs->frameNum - pendingReplayCheckpointLastWaitLogFrame) >= GAME_SPEED) {
+			LOG(
+				"[ReplayRewind] Checkpoint request is waiting for %u pending QTPFS path request%s",
+				pendingQTPFSPaths,
+				(pendingQTPFSPaths == 1) ? "" : "s"
+			);
+			pendingReplayCheckpointLastWaitLogFrame = gs->frameNum;
+		}
+		return;
+	}
+
+	const int requestedFrame = pendingReplayCheckpointRequestedFrame;
+	const float requestedTime = pendingReplayCheckpointRequestedTime;
+	const bool autoCheckpoint = pendingReplayCheckpointIsAuto;
+
+	SaveFileData fileData;
+	fileData.name = std::move(pendingReplayCheckpointFileName);
+	fileData.args = std::move(pendingReplayCheckpointArgs);
+	fileData.replayCheckpoint = true;
+	fileData.replayCheckpointFrame = gs->frameNum;
+	fileData.replayCheckpointTime = gs->frameNum * INV_GAME_SPEED;
+	fileData.replayCheckpointSchema = 1;
+
+	pendingReplayCheckpointFileName.clear();
+	pendingReplayCheckpointArgs.clear();
+	pendingReplayCheckpointSave = false;
+	pendingReplayCheckpointIsAuto = false;
+	pendingReplayCheckpointRequestedFrame = -1;
+	pendingReplayCheckpointRequestedTime = -1.0f;
+	pendingReplayCheckpointLastWaitLogFrame = -1;
+
+	if (requestedFrame >= 0 && requestedFrame != gs->frameNum) {
+		LOG(
+			"[ReplayRewind] Checkpoint requested at %s became safe at %s after waiting %d frame%s",
+			FormatReplayTime(std::max(0, static_cast<int>(requestedTime))).c_str(),
+			FormatReplayTime(std::max(0, gs->frameNum / GAME_SPEED)).c_str(),
+			gs->frameNum - requestedFrame,
+			((gs->frameNum - requestedFrame) == 1) ? "" : "s"
+		);
+	}
+	if (autoCheckpoint)
+		LOG("[ReplayRewind] Auto-checkpoint capture started at %s", FormatReplayTime(std::max(0, gs->frameNum / GAME_SPEED)).c_str());
+
+	ILoadSaveHandler::CreateSave(std::move(fileData));
 }
 
 
@@ -2204,4 +4017,3 @@ const ActionList& CGame::GetLastActionList()
 {
 	return gameInputReceiver.lastActionList;
 }
-

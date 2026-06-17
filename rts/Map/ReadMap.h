@@ -87,10 +87,32 @@ public:
 	void Serialize(creg::ISerializer* s);
 
 private:
+	struct LoadSaveTerrainTile {
+		int tileX = 0;
+		int tileZ = 0;
+		std::vector<float> centerHeights;
+		std::vector<float> maxHeights;
+		std::vector<float3> faceNormals;
+		std::vector<float3> centerNormals;
+		std::vector<float3> centerNormals2DValues;
+		std::vector<float> slopes;
+	};
+
 	void SerializeMapChangesBeforeMatch(creg::ISerializer* s);
 	void SerializeMapChangesDuringMatch(creg::ISerializer* s);
 	void SerializeMapChanges(creg::ISerializer* s, const float* refHeightMap, float* modifiedHeightMap);
 	void SerializeTypeMap(creg::ISerializer* s);
+	void SerializePendingDerivedTerrain(creg::ISerializer* s);
+	void RestorePendingDerivedTerrain();
+
+	std::vector<LoadSaveTerrainTile> loadSaveTerrainTiles;
+	std::vector<float> loadSaveCenterHeightMap;
+	std::vector<float> loadSaveMaxHeightMap;
+	std::vector<float3> loadSaveFaceNormalsSynced;
+	std::vector<float3> loadSaveCenterNormalsSynced;
+	std::vector<float3> loadSaveCenterNormals2D;
+	std::vector<float> loadSaveSlopeMap;
+	std::array<std::vector<float>, 6> loadSaveMipCenterHeightMaps;
 
 public:
 	void PostLoad();

@@ -34,6 +34,7 @@ namespace netcode
 	class UDPListener;
 }
 class CDemoReader;
+struct DemoReaderStreamState;
 class Action;
 class CDemoRecorder;
 class AutohostInterface;
@@ -116,6 +117,31 @@ public:
 
 	const std::unique_ptr<CDemoReader>& GetDemoReader() const { return demoReader; }
 	const std::unique_ptr<CDemoRecorder>& GetDemoRecorder() const { return demoRecorder; }
+	void SkipToReplayFrame(int targetFrameNum);
+	bool IsReplayCheckpointCaptureSafe(int checkpointFrame);
+	bool CaptureDemoReaderStreamState(DemoReaderStreamState& state);
+	bool RestoreDemoReaderStreamState(const DemoReaderStreamState& state);
+	bool CaptureReplayCheckpointNetState(
+		int checkpointFrame,
+		DemoReaderStreamState& demoState,
+		unsigned int& localConnectionInstances,
+		std::vector<std::vector<uint8_t>>& localConnectionQueue0,
+		std::vector<std::vector<uint8_t>>& localConnectionQueue1,
+		int& replayServerFrameNum,
+		float& replayGameTime,
+		float& replayModGameTime,
+		float& replayStartTime
+	);
+	bool RestoreReplayCheckpointNetState(
+		const DemoReaderStreamState& demoState,
+		unsigned int localConnectionInstances,
+		const std::vector<std::vector<uint8_t>>& localConnectionQueue0,
+		const std::vector<std::vector<uint8_t>>& localConnectionQueue1,
+		int replayServerFrameNum,
+		float replayGameTime,
+		float replayModGameTime,
+		float replayStartTime
+	);
 
 private:
 	/**
@@ -183,6 +209,7 @@ private:
 	 * targetFrame to all clients
 	 */
 	void SkipTo(int targetFrameNum);
+	void AlignReplayCheckpointFrame();
 
 	void Message(const std::string& message, bool broadcast = true, bool internal = false);
 	void PrivateMessage(int playerNum, const std::string& message);
@@ -253,6 +280,8 @@ private:
 
 
 	int serverFrameNum = -1;
+	bool replayCheckpointServerFrameRestorePending = false;
+	int replayCheckpointRestoredServerFrameNum = -1;
 
 	int syncErrorFrame = 0;
 	int syncWarningFrame = 0;

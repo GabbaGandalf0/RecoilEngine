@@ -12,9 +12,12 @@ class CGroundMoveType;
 namespace MoveTypes {
 
 struct FeatureCollisionEvent {
-    CUnit* collider;
-    CFeature* collidee;
+    CUnit* collider = nullptr;
+    CFeature* collidee = nullptr;
+    int colliderId = -1;
+    int collideeId = -1;
 
+    FeatureCollisionEvent() = default;
     FeatureCollisionEvent(CUnit* _collider, CFeature* _collidee)
     : collider(_collider)
     , collidee(_collidee)
@@ -22,10 +25,13 @@ struct FeatureCollisionEvent {
 };
 
 struct FeatureCrushEvent {
-    CUnit* collider;
-    CFeature* collidee;
+    CUnit* collider = nullptr;
+    CFeature* collidee = nullptr;
     float3 crushImpulse;
+    int colliderId = -1;
+    int collideeId = -1;
 
+    FeatureCrushEvent() = default;
     FeatureCrushEvent(CUnit* _collider, CFeature* _collidee, float3 _crushImpulse)
     : collider(_collider)
     , collidee(_collidee)
@@ -34,10 +40,13 @@ struct FeatureCrushEvent {
 };
 
 struct FeatureMoveEvent {
-    CUnit* collider;
-    CFeature* collidee;
+    CUnit* collider = nullptr;
+    CFeature* collidee = nullptr;
     float3 moveImpulse;
+    int colliderId = -1;
+    int collideeId = -1;
 
+    FeatureMoveEvent() = default;
     FeatureMoveEvent(CUnit* _collider, CFeature* _collidee, float3 _moveImpulse)
     : collider(_collider)
     , collidee(_collidee)
@@ -46,9 +55,12 @@ struct FeatureMoveEvent {
 };
 
 struct UnitCollisionEvent {
-    CUnit* collider;
-    CUnit* collidee;
+    CUnit* collider = nullptr;
+    CUnit* collidee = nullptr;
+    int colliderId = -1;
+    int collideeId = -1;
 
+    UnitCollisionEvent() = default;
     UnitCollisionEvent(CUnit* _collider, CUnit* _collidee)
     : collider(_collider)
     , collidee(_collidee)
@@ -56,10 +68,13 @@ struct UnitCollisionEvent {
 };
 
 struct UnitCrushEvent {
-    CUnit* collider;
-    CUnit* collidee;
+    CUnit* collider = nullptr;
+    CUnit* collidee = nullptr;
     float3 crushImpulse;
+    int colliderId = -1;
+    int collideeId = -1;
 
+    UnitCrushEvent() = default;
     UnitCrushEvent(CUnit* _collider, CUnit* _collidee, float3 _crushImpulse)
     : collider(_collider)
     , collidee(_collidee)
@@ -69,23 +84,26 @@ struct UnitCrushEvent {
 
 struct UnitMovedEvent {
     CUnit* unit = nullptr;
+    int unitId = -1;
     bool moved = false;
 };
 
 struct ChangeHeadingEvent {
-    int unitId;
+    int unitId = -1;
     short deltaHeading = 0;
     bool changed = false;
 
+    ChangeHeadingEvent() = default;
     ChangeHeadingEvent(int _unitId)
     : unitId(_unitId)
     {}
 };
 
 struct ChangeMainHeadingEvent {
-    int unitId;
+    int unitId = -1;
     bool changed = false;
 
+    ChangeMainHeadingEvent() = default;
     ChangeMainHeadingEvent(int _unitId)
     : unitId(_unitId)
     {}

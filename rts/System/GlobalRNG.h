@@ -62,6 +62,11 @@ public:
 		next();
 	}
 
+	void set_state(const val_type state, const val_type initseq) {
+		val = state;
+		seq = (initseq << 1u) | 1u;
+	}
+
 	res_type next() {
 		const val_type oldval = val;
 
@@ -128,6 +133,12 @@ public:
 		}
 	}
 
+	void SetState(rng_val_type newInitSeed, rng_val_type newLastSeed, rng_val_type newGenState) {
+		initSeed = newInitSeed;
+		lastSeed = newLastSeed;
+		gen.set_state(newGenState, static_cast<rng_val_type>(size_t(this)) * (1 - synced) + RNG::def_seq * synced);
+	}
+
 	rng_val_type GetInitSeed() const { AssureSyncedness(); return initSeed; }
 	rng_val_type GetLastSeed() const { AssureSyncedness(); return lastSeed; }
 	rng_val_type GetGenState() const { AssureSyncedness(); return (gen.state()); }
@@ -189,4 +200,3 @@ typedef CGlobalRNG<PCG32, true , true > CGlobalSyncedRNG;
 typedef CGlobalRNG<PCG32, false, false> CGlobalUnsyncedRNG;
 
 #endif
-

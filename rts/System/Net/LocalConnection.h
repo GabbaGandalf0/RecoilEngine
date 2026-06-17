@@ -4,6 +4,7 @@
 #define _LOCAL_CONNECTION_H
 
 #include <deque>
+#include <vector>
 #include "System/Threading/SpringThreading.h"
 
 #include "Connection.h"
@@ -27,6 +28,18 @@ public:
 	 */
 	CLocalConnection();
 	~CLocalConnection();
+
+	static void CaptureState(
+		unsigned int& outNumInstances,
+		std::vector<std::vector<uint8_t>>& outQueue0,
+		std::vector<std::vector<uint8_t>>& outQueue1
+	);
+	static void QueueRestoreState(
+		unsigned int numInstances,
+		const std::vector<std::vector<uint8_t>>& queue0,
+		const std::vector<std::vector<uint8_t>>& queue1
+	);
+	static void ApplyPendingRestore();
 
 	// START overriding CConnection
 
@@ -58,6 +71,10 @@ private:
 	static std::deque< std::shared_ptr<const RawPacket> > pktQueues[MAX_INSTANCES];
 	static spring::mutex mutexes[MAX_INSTANCES];
 	static CLocalConnection* instancePtrs[MAX_INSTANCES];
+	static spring::mutex pendingRestoreMutex;
+	static bool hasPendingRestore;
+	static unsigned int pendingRestoreNumInstances;
+	static std::vector<std::vector<uint8_t>> pendingRestoreQueues[MAX_INSTANCES];
 
 	unsigned int RemoteInstanceIdx() const { return ((instanceIdx + 1) % MAX_INSTANCES); }
 
@@ -71,4 +88,3 @@ private:
 } // namespace netcode
 
 #endif // _LOCAL_CONNECTION_H
-

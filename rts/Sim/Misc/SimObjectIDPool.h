@@ -2,6 +2,9 @@
 
 #pragma once
 
+#include <cstdint>
+#include <vector>
+
 #include "System/creg/creg_cond.h"
 #include "System/UnorderedMap.hpp"
 
@@ -25,6 +28,9 @@ public:
 		freeIDs.clear();
 		poolIDs.clear();
 		tempIDs.clear();
+		freeIDOrder.clear();
+		tempIDOrder.clear();
+		freeIDOrderCursor = 0;
 	}
 
 	void AssignID(CSolidObject* object);
@@ -36,15 +42,24 @@ public:
 
 	uint32_t GetSize() const { return (freeIDs.size()); } // number of ID's still unused
 	uint32_t MaxSize() const { return (poolIDs.size()); } // number of ID's this pool owns
+	uint64_t GetDebugDigest() const;
 
 private:
+	using IDMap = spring::unordered_map<uint32_t, uint32_t>;
+
 	uint32_t ExtractID();
 
 	void ReserveID(uint32_t uid);
 	void RecycleIDs();
+	void PostLoad();
+	void RefreshFreeIDOrder();
+	void RefreshTempIDOrder();
 
 private:
-	spring::unordered_map<uint32_t, uint32_t> poolIDs; // uid to idx
-	spring::unordered_map<uint32_t, uint32_t> freeIDs; // idx to uid
-	spring::unordered_map<uint32_t, uint32_t> tempIDs; // idx to uid
+	IDMap poolIDs; // uid to idx
+	IDMap freeIDs; // idx to uid
+	IDMap tempIDs; // idx to uid
+	std::vector<uint32_t> freeIDOrder; // explicit UID extraction order, required for deterministic load/save
+	std::vector<uint32_t> tempIDOrder; // explicit delayed-recycle UID order
+	uint32_t freeIDOrderCursor = 0;
 };

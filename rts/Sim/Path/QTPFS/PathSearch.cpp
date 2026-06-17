@@ -1257,11 +1257,23 @@ bool QTPFS::PathSearch::ExecuteRawSearch() {
 	ZoneScoped;
 	assert(pathOwner != nullptr);
 	auto& fwd = directionalSearchData[SearchThreadData::SEARCH_FORWARD];
+	const MoveDef* nodeLayerMoveDef = moveDefHandler.GetMoveDefByPathType(nodeLayer->GetNodelayer());
+
+	if (pathOwner == nullptr || pathOwner->moveDef == nullptr || nodeLayerMoveDef == nullptr) {
+		LOG_L(L_WARNING, "[QTPFS::%s] rejecting raw search with invalid owner or MoveDef: owner=%p ownerMoveDef=%p nodeLayerMoveDef=%p layer=%u",
+			__func__,
+			pathOwner,
+			(pathOwner != nullptr) ? pathOwner->moveDef : nullptr,
+			nodeLayerMoveDef,
+			nodeLayer->GetNodelayer()
+		);
+		haveFullPath = false;
+		return false;
+	}
 
 	int2 nearestSquare;
-	haveFullPath = moveDefHandler.GetMoveDefByPathType(nodeLayer->GetNodelayer())
-			->DoRawSearch( pathOwner, pathOwner->moveDef, fwd.srcPoint, fwd.tgtPoint, goalDistance
-						 , true, true, false, nullptr, nullptr, &nearestSquare, searchThreadData->threadId);
+	haveFullPath = nodeLayerMoveDef->DoRawSearch( pathOwner, pathOwner->moveDef, fwd.srcPoint, fwd.tgtPoint, goalDistance
+						, true, true, false, nullptr, nullptr, &nearestSquare, searchThreadData->threadId);
 
 	if (haveFullPath) {
 		useFwdPathOnly = true;

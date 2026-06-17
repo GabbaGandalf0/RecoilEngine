@@ -7,6 +7,10 @@
 #include <sstream>
 #include "LoadSaveHandler.h"
 
+namespace cregLoadSave {
+	bool ApplyPendingSyncChecksumRestore(unsigned int& checksum);
+}
+
 class CCregLoadSaveHandler : public ILoadSaveHandler
 {
 public:

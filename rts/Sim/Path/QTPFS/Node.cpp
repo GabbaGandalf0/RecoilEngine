@@ -2,6 +2,7 @@
 
 // #undef NDEBUG
 
+#include <algorithm>
 #include <cassert>
 #include <limits>
 
@@ -276,6 +277,125 @@ std::uint64_t QTPFS::QTNode::GetCheckSum(const NodeLayer& nl) const {
 	}
 
 	return sum;
+}
+
+void QTPFS::QTNode::CaptureLoadSaveState(LoadSaveQTNodeState& outState) const
+{
+	RECOIL_DETAILED_TRACY_ZONE;
+	outState = LoadSaveQTNodeState{};
+	outState.active = !NodeDeactivated();
+	outState.poolIndex = GetIndex();
+
+	if (!outState.active)
+		return;
+
+	outState.nodeNumber = nodeNumber;
+	outState.rawIndex = index;
+	outState.childBaseIndex = childBaseIndex;
+	outState.xmin = _xmin;
+	outState.xmax = _xmax;
+	outState.zmin = _zmin;
+	outState.zmax = _zmax;
+	outState.moveCostAvg = moveCostAvg;
+
+	outState.neighbours.reserve(neighbours.size());
+	for (const auto& neighbour : neighbours) {
+		LoadSaveNodeNeighbour savedNeighbour;
+		savedNeighbour.nodeId = neighbour.nodeId;
+		savedNeighbour.netPoints.reserve(QTPFS_MAX_NETPOINTS_PER_NODE_EDGE);
+
+		for (const float2& netPoint : neighbour.netpoints) {
+			savedNeighbour.netPoints.emplace_back(LoadSaveNetPoint{netPoint.x, netPoint.y});
+		}
+
+		outState.neighbours.emplace_back(std::move(savedNeighbour));
+	}
+}
+
+void QTPFS::QTNode::RestoreLoadSaveState(const LoadSaveQTNodeState& inState)
+{
+	RECOIL_DETAILED_TRACY_ZONE;
+
+	if (!inState.active) {
+		nodeNumber = -1u;
+		index = 0;
+		childBaseIndex = -1u;
+		moveCostAvg = -1.0f;
+		neighbours.clear();
+		DeactivateNode();
+		return;
+	}
+
+	nodeNumber = inState.nodeNumber;
+	index = inState.rawIndex;
+	childBaseIndex = inState.childBaseIndex;
+	_xmin = inState.xmin;
+	_xmax = inState.xmax;
+	_zmin = inState.zmin;
+	_zmax = inState.zmax;
+	moveCostAvg = inState.moveCostAvg;
+
+	neighbours.clear();
+	neighbours.reserve(inState.neighbours.size());
+
+	for (const auto& savedNeighbour : inState.neighbours) {
+		NeighbourPoints neighbourPoints;
+		neighbourPoints.nodeId = savedNeighbour.nodeId;
+
+		for (size_t i = 0; i < neighbourPoints.netpoints.size(); ++i) {
+			if (i < savedNeighbour.netPoints.size()) {
+				neighbourPoints.netpoints[i] = float2(savedNeighbour.netPoints[i].x, savedNeighbour.netPoints[i].y);
+			} else {
+				neighbourPoints.netpoints[i] = float2(0.0f, 0.0f);
+			}
+		}
+
+		neighbours.emplace_back(std::move(neighbourPoints));
+	}
+}
+
+bool QTPFS::QTNode::SanitizeLoadSaveState(const NodeLayer& nodeLayer, unsigned int maxNodesAlloced)
+{
+	RECOIL_DETAILED_TRACY_ZONE;
+
+	if (NodeDeactivated())
+		return false;
+
+	if (childBaseIndex != -1u) {
+		const bool childRangeValid = (childBaseIndex <= maxNodesAlloced) && ((maxNodesAlloced - childBaseIndex) >= QTNODE_CHILD_COUNT);
+
+		if (childRangeValid) {
+			for (unsigned int i = 0; i < QTNODE_CHILD_COUNT; ++i) {
+				const INode* childNode = nodeLayer.GetPoolNode(childBaseIndex + i);
+				if (childNode->NodeDeactivated()) {
+					childBaseIndex = -1u;
+					break;
+				}
+			}
+		} else {
+			childBaseIndex = -1u;
+		}
+	}
+
+	if (!IsLeaf()) {
+		neighbours.clear();
+		return true;
+	}
+
+	neighbours.erase(
+		std::remove_if(neighbours.begin(), neighbours.end(), [&nodeLayer, maxNodesAlloced](const NeighbourPoints& neighbour) {
+			if (neighbour.nodeId < 0)
+				return true;
+			if (static_cast<unsigned int>(neighbour.nodeId) >= maxNodesAlloced)
+				return true;
+
+			const INode* neighbourNode = nodeLayer.GetPoolNode(neighbour.nodeId);
+			return (neighbourNode->NodeDeactivated() || !neighbourNode->IsLeaf());
+		}),
+		neighbours.end()
+	);
+
+	return true;
 }
 
 
@@ -1010,4 +1130,3 @@ bool QTPFS::QTNode::UpdateNeighborCache(NodeLayer& nodeLayer, UpdateThreadData& 
 
 	return true;
 }
-

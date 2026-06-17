@@ -20,6 +20,12 @@ public:
 
 	bool Disabled() const override { return false; }
 
+#ifdef USING_CREG
+	void Serialize(creg::ISerializer* s) override;
+#endif
+
+	void GetPendingTerrainRecalcRects(std::vector<SRectangle>& rects) const override;
+
 private:
 	void SetExplosionSquare(float v) {
 		explosionSquaresPool[explSquaresPoolIdx] = v;

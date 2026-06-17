@@ -4,6 +4,13 @@
 #define _MAP_DAMAGE_H_
 
 #include "System/float3.h"
+#include "System/Rectangle.h"
+
+#include <vector>
+
+namespace creg {
+	class ISerializer;
+}
 
 class IMapDamage
 {
@@ -23,6 +30,12 @@ public:
 	virtual void Update() = 0;
 
 	virtual bool Disabled() const = 0;
+
+#ifdef USING_CREG
+	virtual void Serialize(creg::ISerializer*) {}
+#endif
+
+	virtual void GetPendingTerrainRecalcRects(std::vector<SRectangle>&) const {}
 
 	float mapHardness = 0.0f;
 };

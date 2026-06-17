@@ -2,6 +2,7 @@
 
 // #undef NDEBUG
 
+#include <algorithm>
 #include <limits>
 
 #if defined(_MSC_VER)
@@ -83,6 +84,162 @@ void QTPFS::NodeLayer::Clear() {
 	RECOIL_DETAILED_TRACY_ZONE;
 	curSpeedMods.clear();
 	curSpeedBins.clear();
+}
+
+void QTPFS::NodeLayer::CaptureLoadSaveState(LoadSaveNodeLayerState& outState) const
+{
+	RECOIL_DETAILED_TRACY_ZONE;
+	outState = LoadSaveNodeLayerState{};
+
+	outState.layerNumber = layerNumber;
+	outState.numLeafNodes = numLeafNodes;
+	outState.updateCounter = updateCounter;
+	outState.numOpenNodes = numOpenNodes;
+	outState.numClosedNodes = numClosedNodes;
+	outState.maxNodesAlloced = maxNodesAlloced;
+	outState.numRootNodes = numRootNodes;
+	outState.xRootNodes = xRootNodes;
+	outState.zRootNodes = zRootNodes;
+	outState.rootNodeSize = rootNodeSize;
+	outState.rootMask = rootMask;
+	outState.xsize = xsize;
+	outState.zsize = zsize;
+	outState.maxRelSpeedMod = maxRelSpeedMod;
+	outState.avgRelSpeedMod = avgRelSpeedMod;
+	outState.useShortestPath = useShortestPath;
+
+	outState.recycledNodeIndices.reserve(nodeIndcs.size());
+	for (const unsigned int nodeIndex : nodeIndcs) {
+		if (nodeIndex < static_cast<unsigned int>(maxNodesAlloced))
+			outState.recycledNodeIndices.emplace_back(nodeIndex);
+	}
+
+	outState.poolNodeStates.reserve(std::max<int32_t>(0, maxNodesAlloced - static_cast<int32_t>(outState.recycledNodeIndices.size())));
+	for (int32_t nodeIndex = 0; nodeIndex < maxNodesAlloced; ++nodeIndex) {
+		LoadSaveQTNodeState nodeState;
+		GetPoolNode(nodeIndex)->CaptureLoadSaveState(nodeState);
+
+		if (nodeState.active)
+			outState.poolNodeStates.emplace_back(nodeState);
+	}
+}
+
+void QTPFS::NodeLayer::RestoreLoadSaveState(const LoadSaveNodeLayerState& inState)
+{
+	RECOIL_DETAILED_TRACY_ZONE;
+
+	for (auto& poolChunk: poolNodes) {
+		poolChunk.clear();
+	}
+
+	nodeIndcs.clear();
+	nodeIndcs.resize(POOL_TOTAL_SIZE);
+	std::for_each(nodeIndcs.begin(), nodeIndcs.end(), [&](const unsigned int& i) {
+		nodeIndcs[&i - &nodeIndcs[0]] = &i - &nodeIndcs[0];
+		assert((size_t)(&i - &nodeIndcs[0]) < nodeIndcs.size());
+	});
+	std::reverse(nodeIndcs.begin(), nodeIndcs.end());
+
+	curSpeedMods.assign(QTPFS_MAX_NODE_SIZE * QTPFS_MAX_NODE_SIZE, 0);
+	curSpeedBins.assign(QTPFS_MAX_NODE_SIZE * QTPFS_MAX_NODE_SIZE, -1);
+	selectedNodes.clear();
+	openNodes.clear();
+
+	layerNumber = inState.layerNumber;
+	updateCounter = inState.updateCounter;
+	numRootNodes = inState.numRootNodes;
+	xRootNodes = inState.xRootNodes;
+	zRootNodes = inState.zRootNodes;
+	rootNodeSize = inState.rootNodeSize;
+	rootMask = inState.rootMask;
+	xsize = inState.xsize;
+	zsize = inState.zsize;
+	maxRelSpeedMod = inState.maxRelSpeedMod;
+	avgRelSpeedMod = inState.avgRelSpeedMod;
+	useShortestPath = inState.useShortestPath;
+
+	maxNodesAlloced = 0;
+	const int32_t restoredNodeCount = std::clamp<int32_t>(inState.maxNodesAlloced, 0, static_cast<int32_t>(POOL_TOTAL_SIZE));
+
+	for (int32_t nodeIndex = 0; nodeIndex < restoredNodeCount; ++nodeIndex) {
+		const unsigned int allocIndex = AllocPoolNode(nullptr, 0, 0, 0, 1, 1);
+		assert(allocIndex == static_cast<unsigned int>(nodeIndex));
+		(void) allocIndex;
+	}
+
+	maxNodesAlloced = restoredNodeCount;
+
+	LoadSaveQTNodeState inactiveNodeState;
+	std::vector<uint8_t> activeNodeIndices(restoredNodeCount, 0);
+	std::vector<uint8_t> recycledNodeIndices(restoredNodeCount, 0);
+
+	for (int32_t nodeIndex = 0; nodeIndex < restoredNodeCount; ++nodeIndex) {
+		GetPoolNode(nodeIndex)->RestoreLoadSaveState(inactiveNodeState);
+	}
+
+	for (const LoadSaveQTNodeState& savedNodeState : inState.poolNodeStates) {
+		if (!savedNodeState.active)
+			continue;
+
+		unsigned int restoredPoolIndex = savedNodeState.poolIndex;
+
+		if (restoredPoolIndex >= static_cast<unsigned int>(restoredNodeCount))
+			continue;
+
+		GetPoolNode(restoredPoolIndex)->RestoreLoadSaveState(savedNodeState);
+		activeNodeIndices[restoredPoolIndex] = 1;
+	}
+
+	numLeafNodes = 0;
+	numOpenNodes = 0;
+	numClosedNodes = 0;
+
+	for (int32_t nodeIndex = 0; nodeIndex < restoredNodeCount; ++nodeIndex) {
+		if (activeNodeIndices[nodeIndex] == 0)
+			continue;
+
+		QTNode* node = GetPoolNode(nodeIndex);
+		if (!node->SanitizeLoadSaveState(*this, restoredNodeCount)) {
+			node->RestoreLoadSaveState(inactiveNodeState);
+			activeNodeIndices[nodeIndex] = 0;
+			continue;
+		}
+
+		if (!node->IsLeaf())
+			continue;
+
+		++numLeafNodes;
+		if (node->AllSquaresImpassable()) {
+			++numClosedNodes;
+		} else {
+			++numOpenNodes;
+		}
+	}
+
+	nodeIndcs.erase(
+		std::remove_if(nodeIndcs.begin(), nodeIndcs.end(), [this](unsigned int nodeIndex) {
+			return (nodeIndex < static_cast<unsigned int>(maxNodesAlloced));
+		}),
+		nodeIndcs.end()
+	);
+
+	for (const unsigned int recycledNodeIndex : inState.recycledNodeIndices) {
+		if (recycledNodeIndex >= static_cast<unsigned int>(restoredNodeCount))
+			continue;
+		if (activeNodeIndices[recycledNodeIndex] != 0 || recycledNodeIndices[recycledNodeIndex] != 0)
+			continue;
+
+		nodeIndcs.emplace_back(recycledNodeIndex);
+		recycledNodeIndices[recycledNodeIndex] = 1;
+	}
+
+	for (int32_t nodeIndex = 0; nodeIndex < restoredNodeCount; ++nodeIndex) {
+		if (activeNodeIndices[nodeIndex] != 0 || recycledNodeIndices[nodeIndex] != 0)
+			continue;
+
+		nodeIndcs.emplace_back(nodeIndex);
+		recycledNodeIndices[nodeIndex] = 1;
+	}
 }
 
 

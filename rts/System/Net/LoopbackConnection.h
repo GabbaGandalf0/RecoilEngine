@@ -20,6 +20,7 @@ public:
 	std::shared_ptr<const RawPacket> Peek(unsigned ahead) const override;
 	std::shared_ptr<const RawPacket> GetData() override;
 	void DeleteBufferPacketAt(unsigned index) override;
+	void ClearQueue();
 	void Flush(const bool forced) override {}
 	bool CheckTimeout(int seconds, bool initial) const override { return false; }
 
@@ -40,4 +41,3 @@ private:
 } // namespace netcode
 
 #endif // _LOOPBACK_CONNECTION_H
-

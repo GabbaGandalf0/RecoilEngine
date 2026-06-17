@@ -13,6 +13,9 @@
 #include "Sim/Units/UnitHandler.h"
 #include "Sim/Path/IPathManager.h"
 #include "Sim/Features/FeatureHandler.h"
+#include "System/creg/ISerializer.h"
+#include "System/Exceptions.h"
+#include "System/Log/ILog.h"
 #include "System/TimeProfiler.h"
 
 #include "System/Misc/TracyDefs.h"
@@ -57,6 +60,111 @@ void CBasicMapDamage::Init()
 	explosionUpdateQueue.reserve(64);
 
 	std::fill(explosionSquaresPool.begin(), explosionSquaresPool.end(), 0.0f);
+}
+
+#ifdef USING_CREG
+void CBasicMapDamage::Serialize(creg::ISerializer* s)
+{
+	RECOIL_DETAILED_TRACY_ZONE;
+
+	constexpr uint32_t STATE_VERSION = 1;
+	uint32_t stateVersion = STATE_VERSION;
+	s->Serialize(stateVersion);
+
+	if (!s->IsWriting() && stateVersion != STATE_VERSION)
+		throw content_error("[CBasicMapDamage::Serialize] unsupported rewind map-damage state version");
+
+	s->Serialize(explSquaresPoolIdx);
+	s->Serialize(explUpdateQueueIdx);
+
+	uint32_t queueSize = static_cast<uint32_t>(explosionUpdateQueue.size());
+	s->Serialize(queueSize);
+
+	if (!s->IsWriting()) {
+		explosionUpdateQueue.clear();
+		explosionUpdateQueue.resize(queueSize);
+
+		if (explosionSquaresPool.empty())
+			explosionSquaresPool.resize(4 * 1024 * 1024, 0.0f);
+	}
+
+	for (uint32_t queueIndex = 0; queueIndex < queueSize; ++queueIndex) {
+		Explo& explosion = explosionUpdateQueue[queueIndex];
+
+		s->Serialize(explosion.pos.x);
+		s->Serialize(explosion.pos.y);
+		s->Serialize(explosion.pos.z);
+		s->Serialize(explosion.strength);
+		s->Serialize(explosion.radius);
+		s->Serialize(explosion.ttl);
+		s->Serialize(explosion.x1);
+		s->Serialize(explosion.x2);
+		s->Serialize(explosion.y1);
+		s->Serialize(explosion.y2);
+		s->Serialize(explosion.idx);
+
+		uint32_t buildingCount = static_cast<uint32_t>(explosion.buildings.size());
+		s->Serialize(buildingCount);
+
+		if (!s->IsWriting())
+			explosion.buildings.resize(buildingCount);
+
+		for (ExploBuilding& building: explosion.buildings) {
+			s->Serialize(building.id);
+			s->Serialize(building.dif);
+			s->Serialize(building.tx1);
+			s->Serialize(building.tx2);
+			s->Serialize(building.tz1);
+			s->Serialize(building.tz2);
+		}
+
+		const uint32_t expectedSquareCount =
+			static_cast<uint32_t>(std::max(0, explosion.x2 - explosion.x1 + 1)) *
+			static_cast<uint32_t>(std::max(0, explosion.y2 - explosion.y1 + 1));
+		uint32_t squareCount = expectedSquareCount;
+		s->Serialize(squareCount);
+
+		if (!s->IsWriting() && squareCount != expectedSquareCount)
+			throw content_error("[CBasicMapDamage::Serialize] corrupt rewind explosion-square count");
+
+		for (uint32_t squareIndex = 0; squareIndex < squareCount; ++squareIndex) {
+			const size_t poolIndex = (static_cast<size_t>(explosion.idx) + squareIndex) % explosionSquaresPool.size();
+			float squareValue = explosionSquaresPool[poolIndex];
+			s->Serialize(squareValue);
+
+			if (!s->IsWriting())
+				explosionSquaresPool[poolIndex] = squareValue;
+		}
+	}
+
+	if (!s->IsWriting() && explUpdateQueueIdx > explosionUpdateQueue.size())
+		throw content_error("[CBasicMapDamage::Serialize] corrupt rewind explosion queue index");
+
+	LOG("[ReplayRewind] %s map-damage state: queue=%u activeFrom=%u poolIndex=%u",
+		s->IsWriting() ? "captured" : "restored",
+		queueSize,
+		explUpdateQueueIdx,
+		explSquaresPoolIdx
+	);
+}
+#endif
+
+void CBasicMapDamage::GetPendingTerrainRecalcRects(std::vector<SRectangle>& rects) const
+{
+	for (size_t queueIndex = explUpdateQueueIdx; queueIndex < explosionUpdateQueue.size(); ++queueIndex) {
+		const Explo& explosion = explosionUpdateQueue[queueIndex];
+
+		if (explosion.ttl <= 0)
+			continue;
+
+		// RecalcArea expands the touched region further through normals and slope maps.
+		rects.emplace_back(
+			std::max(0, explosion.x1 - 4),
+			std::max(0, explosion.y1 - 4),
+			std::min(mapDims.mapx, explosion.x2 + 5),
+			std::min(mapDims.mapy, explosion.y2 + 5)
+		);
+	}
 }
 
 
@@ -308,4 +416,3 @@ void CBasicMapDamage::Update()
 	explosionUpdateQueue.clear();
 	explUpdateQueueIdx = 0;
 }
-

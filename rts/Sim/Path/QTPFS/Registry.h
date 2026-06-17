@@ -1,5 +1,5 @@
-#ifndef QTPFS_REGISTRY_H__
-#define QTPFS_REGISTRY_H__
+#ifndef QTPFS_PATH_REGISTRY_H__
+#define QTPFS_PATH_REGISTRY_H__
 
 /**
  * Important! Group ownerships used on this registry:

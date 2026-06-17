@@ -1,6 +1,9 @@
 /* This file is part of the Spring engine (GPL v2 or later), see LICENSE.html */
+#include <algorithm>
 #include <array>
+#include <cctype>
 #include <functional>
+#include <sstream>
 #include <tuple>
 
 #include "UnsyncedGameCommands.h"
@@ -104,6 +107,8 @@
 #include "System/TimeProfiler.h"
 #include "System/Log/ILog.h"
 #include "System/Config/ConfigHandler.h"
+#include "System/FileSystem/FileHandler.h"
+#include "System/FileSystem/FileSystem.h"
 #include "System/FileSystem/SimpleParser.h"
 #include "System/Sound/ISound.h"
 #include "System/Sound/ISoundChannels.h"
@@ -111,6 +116,8 @@
 
 #include <SDL_events.h>
 #include <SDL_video.h>
+
+#include "fmt/format.h"
 
 namespace { // prevents linking problems in case of duplicate symbols
 
@@ -144,6 +151,165 @@ namespace { // prevents linking problems in case of duplicate symbols
 		return true;
 	}
 	// end of helper function
+
+	struct ReplayCheckpointEntry {
+		int seconds = 0;
+		int frame = 0;
+		std::string id;
+		std::string savePath;
+	};
+
+	static constexpr int replayAutoCheckpointInterval = 600;
+
+	static std::string TrimString(std::string value)
+	{
+		const auto first = value.find_first_not_of(" \t\r\n");
+		if (first == std::string::npos)
+			return "";
+
+		const auto last = value.find_last_not_of(" \t\r\n");
+		return value.substr(first, (last - first) + 1);
+	}
+
+	static std::string FormatReplayTime(int totalSeconds)
+	{
+		totalSeconds = std::max(0, totalSeconds);
+
+		const int hours = totalSeconds / 3600;
+		const int minutes = (totalSeconds % 3600) / 60;
+		const int seconds = totalSeconds % 60;
+
+		if (hours > 0)
+			return fmt::format("{}:{:02d}:{:02d}", hours, minutes, seconds);
+
+		return fmt::format("{:02d}:{:02d}", minutes, seconds);
+	}
+
+	static bool ParseUnsignedTimeToken(const std::string& text, int& outSeconds)
+	{
+		const std::string value = TrimString(text);
+		if (value.empty())
+			return false;
+
+		if (std::all_of(value.begin(), value.end(), [](unsigned char c) { return std::isdigit(c) != 0; })) {
+			outSeconds = std::max(0, atoi(value.c_str()));
+			return true;
+		}
+
+		std::vector<int> parts;
+		std::string part;
+		std::istringstream stream(value);
+
+		while (std::getline(stream, part, ':')) {
+			if (part.empty())
+				return false;
+			if (!std::all_of(part.begin(), part.end(), [](unsigned char c) { return std::isdigit(c) != 0; }))
+				return false;
+
+			parts.push_back(std::max(0, atoi(part.c_str())));
+		}
+
+		if (parts.size() == 2) {
+			if (parts[1] >= 60)
+				return false;
+
+			outSeconds = (parts[0] * 60) + parts[1];
+			return true;
+		}
+
+		if (parts.size() == 3) {
+			if (parts[1] >= 60 || parts[2] >= 60)
+				return false;
+
+			outSeconds = (parts[0] * 3600) + (parts[1] * 60) + parts[2];
+			return true;
+		}
+
+		return false;
+	}
+
+	static bool ResolveReplayTargetSeconds(const std::string& text, int currentSeconds, int& outTargetSeconds, std::string& error)
+	{
+		const std::string value = TrimString(text);
+		if (value.empty()) {
+			error = "Usage: /rew -15, /rew +15, /rew 12:34, /rew 1:02:03, /rew status";
+			return false;
+		}
+
+		const char prefix = value[0];
+		if (prefix == '+' || prefix == '-') {
+			int deltaSeconds = 0;
+			if (!ParseUnsignedTimeToken(value.substr(1), deltaSeconds)) {
+				error = "Allowed: +15, -15, 12:34, 1:02:03.";
+				return false;
+			}
+
+			outTargetSeconds = std::max(0, currentSeconds + ((prefix == '+') ? deltaSeconds : -deltaSeconds));
+			return true;
+		}
+
+		if (!ParseUnsignedTimeToken(value, outTargetSeconds)) {
+			error = "Allowed: +15, -15, 12:34, 1:02:03.";
+			return false;
+		}
+
+		outTargetSeconds = std::max(0, outTargetSeconds);
+		return true;
+	}
+
+	static bool ParseReplayCheckpointSeconds(const std::string& savePath, int& outSeconds)
+	{
+		const std::string fileName = FileSystem::GetFilename(savePath);
+		const std::string prefix = "rrw_cp_";
+		const std::string suffix = ".ssf";
+
+		if (fileName.size() <= (prefix.size() + suffix.size()))
+			return false;
+		if (fileName.compare(0, prefix.size(), prefix) != 0)
+			return false;
+		if (fileName.compare(fileName.size() - suffix.size(), suffix.size(), suffix) != 0)
+			return false;
+
+		const std::string numberText = fileName.substr(prefix.size(), fileName.size() - prefix.size() - suffix.size());
+		if (numberText.empty())
+			return false;
+		if (!std::all_of(numberText.begin(), numberText.end(), [](unsigned char c) { return std::isdigit(c) != 0; }))
+			return false;
+
+		outSeconds = std::max(0, atoi(numberText.c_str()));
+		return true;
+	}
+
+	static std::vector<ReplayCheckpointEntry> CollectReplayCheckpoints()
+	{
+		std::vector<ReplayCheckpointEntry> checkpoints;
+
+		for (const std::string& savePath: CFileHandler::DirList("Saves", "rrw_cp_*.ssf", SPRING_VFS_RAW, false)) {
+			int checkpointSeconds = 0;
+			if (!ParseReplayCheckpointSeconds(savePath, checkpointSeconds))
+				continue;
+
+			ReplayCheckpointEntry entry;
+			entry.seconds = checkpointSeconds;
+			entry.frame = checkpointSeconds * GAME_SPEED;
+			entry.id = fmt::format("rrw_cp_{:06d}", checkpointSeconds);
+			entry.savePath = savePath;
+			checkpoints.push_back(std::move(entry));
+		}
+
+		std::sort(checkpoints.begin(), checkpoints.end(), [](const ReplayCheckpointEntry& lhs, const ReplayCheckpointEntry& rhs) {
+			return lhs.seconds < rhs.seconds;
+		});
+
+		return checkpoints;
+	}
+
+	static void LogReplayHelp()
+	{
+		LOG("[ReplayRewind] Commands: /rew -15, /rew +15, /rew 12:34, /rew 1:02:03");
+		LOG("[ReplayRewind] Commands: /cp creates a checkpoint now, /rew status shows checkpoint status");
+		LOG("[ReplayRewind] Auto-checkpoints run every %s", FormatReplayTime(replayAutoCheckpointInterval).c_str());
+	}
 
 /**
  * Special case executor which is used for creating aliases to other commands.
@@ -3752,6 +3918,166 @@ private:
 	bool usecreg;
 };
 
+/// /savereplaycheckpoint [-y ]<savename>
+class SaveReplayCheckpointActionExecutor : public IUnsyncedActionExecutor {
+public:
+	SaveReplayCheckpointActionExecutor() : IUnsyncedActionExecutor(
+		"SaveReplayCheckpoint",
+		"Save a replay checkpoint to a specific file, add -y to overwrite when file is already present"
+	) {
+	}
+
+	bool Execute(const UnsyncedAction& action) const final {
+		if (game == nullptr || gameSetup == nullptr)
+			return false;
+
+		if (!gameSetup->hostDemo) {
+			LOG_L(L_WARNING, "/SaveReplayCheckpoint can only be used while watching a replay");
+			return true;
+		}
+
+		std::vector<std::string> args = CSimpleParser::Tokenize(action.GetArgs());
+
+		switch (args.size()) {
+			case 1: {
+				game->SaveReplayCheckpoint("Saves/" + args[0] + ".ssf", "", gs->frameNum, gu->gameTime);
+				return true;
+			} break;
+			case 2: {
+				game->SaveReplayCheckpoint("Saves/" + args[0] + ".ssf", std::move(args[1]), gs->frameNum, gu->gameTime);
+				return true;
+			} break;
+			default: {
+			} break;
+		}
+
+		return false;
+	}
+};
+
+class ReplayCheckpointActionExecutor : public IUnsyncedActionExecutor {
+public:
+	ReplayCheckpointActionExecutor(const std::string& commandName)
+		: IUnsyncedActionExecutor(commandName, "Create a replay checkpoint at the current replay time")
+	{}
+
+	bool Execute(const UnsyncedAction& action) const final {
+		if (game == nullptr || gameSetup == nullptr)
+			return false;
+		if (!gameSetup->hostDemo) {
+			LOG_L(L_WARNING, "/%s can only be used while watching a replay", GetCommand().c_str());
+			return true;
+		}
+
+		const int currentSeconds = std::max(0, gs->frameNum / GAME_SPEED);
+		const std::string checkpointId = fmt::format("rrw_cp_{:06d}", currentSeconds);
+
+		game->SaveReplayCheckpoint(
+			"Saves/" + checkpointId + ".ssf",
+			"-y",
+			gs->frameNum,
+			gu->gameTime
+		);
+
+		LOG("[ReplayRewind] Creating checkpoint at %s ...", FormatReplayTime(currentSeconds).c_str());
+		return true;
+	}
+};
+
+class ReplayRewindActionExecutor : public IUnsyncedActionExecutor {
+public:
+	ReplayRewindActionExecutor(const std::string& commandName)
+		: IUnsyncedActionExecutor(commandName, "Replay rewind and replay jump commands")
+	{}
+
+	bool Execute(const UnsyncedAction& action) const final {
+		if (game == nullptr || gameSetup == nullptr || gs == nullptr)
+			return false;
+		if (!gameSetup->hostDemo) {
+			LOG_L(L_WARNING, "/%s can only be used while watching a replay", GetCommand().c_str());
+			return true;
+		}
+
+		const std::string args = TrimString(action.GetArgs());
+		const std::string argsLower = StringToLower(args);
+
+		if (args.empty() || argsLower == "help" || argsLower == "?") {
+			LogReplayHelp();
+			return true;
+		}
+
+		if (argsLower == "status" || argsLower == "checkpoints") {
+			const auto checkpoints = CollectReplayCheckpoints();
+
+			if (checkpoints.empty()) {
+				LOG("[ReplayRewind] No checkpoints are ready yet. Auto-checkpoints are created every %s.", FormatReplayTime(replayAutoCheckpointInterval).c_str());
+				return true;
+			}
+
+			const ReplayCheckpointEntry& latest = checkpoints.back();
+			LOG("[ReplayRewind] %u checkpoints are ready. Latest at %s.", unsigned(checkpoints.size()), FormatReplayTime(latest.seconds).c_str());
+			return true;
+		}
+
+		if (argsLower == "cp" || argsLower == "checkpoint") {
+			ReplayCheckpointActionExecutor checkpointExec("cp");
+			return checkpointExec.Execute(action);
+		}
+
+		int targetSeconds = 0;
+		std::string error;
+		if (!ResolveReplayTargetSeconds(args, std::max(0, gs->frameNum / GAME_SPEED), targetSeconds, error)) {
+			LOG("[ReplayRewind] %s", error.c_str());
+			return true;
+		}
+
+		const int currentFrame = gs->frameNum;
+		const int targetFrame = targetSeconds * GAME_SPEED;
+
+		if (targetFrame == currentFrame) {
+			LOG("[ReplayRewind] You are already at %s.", FormatReplayTime(targetSeconds).c_str());
+			return true;
+		}
+
+		if (targetFrame > currentFrame) {
+			if (clientNet != nullptr) {
+				CommandMessage msg(Action("skip " + std::to_string(std::max(0, targetSeconds))), gu->myPlayerNum);
+				clientNet->Send(msg.Pack());
+				LOG("[ReplayRewind] Jumping forward to %s.", FormatReplayTime(targetSeconds).c_str());
+				return true;
+			}
+
+			LOG_L(L_WARNING, "[ReplayRewind] Skip is not available.");
+			return true;
+		}
+
+		const auto checkpoints = CollectReplayCheckpoints();
+		const ReplayCheckpointEntry* bestCheckpoint = nullptr;
+
+		for (const ReplayCheckpointEntry& checkpoint: checkpoints) {
+			if (checkpoint.seconds <= targetSeconds) {
+				bestCheckpoint = &checkpoint;
+			} else {
+				break;
+			}
+		}
+
+		if (bestCheckpoint != nullptr) {
+			LOG("[ReplayRewind] Preparing checkpoint rewind to %s ...", FormatReplayTime(bestCheckpoint->seconds).c_str());
+			if (!game->QueueReplayResumeFromCheckpoint(bestCheckpoint->savePath, targetFrame, static_cast<float>(targetSeconds))) {
+				LOG_L(L_WARNING, "[ReplayRewind] Could not trigger checkpoint reload.");
+			}
+			return true;
+		}
+
+		LOG("[ReplayRewind] No precise checkpoint is ready. Preparing normal replay rewind to %s ...", FormatReplayTime(targetSeconds).c_str());
+		if (!game->QueueReplayResumeFromStart(targetFrame, static_cast<float>(targetSeconds))) {
+			LOG_L(L_WARNING, "[ReplayRewind] Could not trigger replay reload.");
+		}
+		return true;
+	}
+};
+
 
 
 class ReloadShadersActionExecutor : public IUnsyncedActionExecutor {
@@ -4207,6 +4533,11 @@ void UnsyncedGameCommands::AddDefaultActionExecutors()
 	AddActionExecutor(AllocActionExecutor<DumpRNGActionExecutor>());
 	AddActionExecutor(AllocActionExecutor<SaveActionExecutor>(true));
 	AddActionExecutor(AllocActionExecutor<SaveActionExecutor>(false));
+	AddActionExecutor(AllocActionExecutor<SaveReplayCheckpointActionExecutor>());
+	AddActionExecutor(AllocActionExecutor<ReplayCheckpointActionExecutor>("cp"));
+	AddActionExecutor(AllocActionExecutor<ReplayCheckpointActionExecutor>("checkpoint"));
+	AddActionExecutor(AllocActionExecutor<ReplayRewindActionExecutor>("rew"));
+	AddActionExecutor(AllocActionExecutor<ReplayRewindActionExecutor>("rw"));
 	AddActionExecutor(AllocActionExecutor<ReloadShadersActionExecutor>());
 	AddActionExecutor(AllocActionExecutor<ReloadTexturesActionExecutor>());
 	AddActionExecutor(AllocActionExecutor<DumpAtlasActionExecutor>());

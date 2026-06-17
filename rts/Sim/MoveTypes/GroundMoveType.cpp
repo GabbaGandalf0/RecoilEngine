@@ -8,6 +8,7 @@
 #include "ExternalAI/EngineOutHandler.h"
 #include "Game/Camera.h"
 #include "Game/GameHelper.h"
+#include "Game/GameSetup.h"
 #include "Game/GlobalUnsynced.h"
 #include "Game/SelectedUnitsHandler.h"
 #include "Game/Players/Player.h"
@@ -23,6 +24,7 @@
 #include "Sim/Misc/QuadField.h"
 #include "Sim/Misc/TeamHandler.h"
 #include "Sim/Path/IPathManager.h"
+#include "Sim/Path/QTPFS/PathManager.h"
 #include "Sim/Units/Scripts/CobInstance.h"
 #include "Sim/Units/CommandAI/CommandAI.h"
 #include "Sim/Units/CommandAI/MobileCAI.h"
@@ -565,6 +567,30 @@ void CGroundMoveType::PostLoad()
 
 	Connect();
 
+	if (gameSetup != nullptr && gameSetup->replayCheckpoint) {
+		// Rewind checkpoints restore the complete QTPFS state after all creg
+		// PostLoad hooks have run. Re-requesting a path here mutates the loaded
+		// move-state before that restore can reconnect the saved path entities.
+		return;
+	}
+
+	if (auto* qtpfsPathManager = dynamic_cast<QTPFS::PathManager*>(pathManager); qtpfsPathManager != nullptr) {
+		if ((pathID != 0) && qtpfsPathManager->HasQueuedFullLoadSaveState()) {
+			return;
+		}
+
+		const bool haveCurrentPath = (pathID != 0) && qtpfsPathManager->HasLivePathForOwner(pathID, owner, true);
+
+		if ((nextPathId != 0) && !qtpfsPathManager->HasLivePath(nextPathId))
+			nextPathId = 0;
+		if ((deletePathId != 0) && !qtpfsPathManager->HasLivePath(deletePathId))
+			deletePathId = 0;
+
+		if (haveCurrentPath) {
+			return;
+		}
+	}
+
 	// HACK: re-initialize path after load
 	if (pathID == 0)
 		return;
@@ -573,6 +599,49 @@ void CGroundMoveType::PostLoad()
 	// before requesting our new path; otherwise, a valid path for another unit could be deleted.
 	pathID = 0;
 	pathID = pathManager->RequestPath(owner, owner->moveDef, owner->pos, goalPos, goalRadius + extraRadius, true);
+}
+
+bool CGroundMoveType::NeedsLoadSavePathReinit() const
+{
+	RECOIL_DETAILED_TRACY_ZONE;
+	if ((uint8_t*)owner->moveType != owner->amtMemBuffer)
+		return false;
+	if (owner->moveDef == nullptr)
+		return false;
+	if (useRawMovement)
+		return false;
+	if (progressState != Active)
+		return false;
+	if (atGoal)
+		return false;
+	if ((owner->pos - goalPos).SqLength2D() <= Square(goalRadius + extraRadius))
+		return false;
+
+	return true;
+}
+
+void CGroundMoveType::RebuildPathAfterLoadSaveRestore(bool force)
+{
+	RECOIL_DETAILED_TRACY_ZONE;
+	if (!force && !NeedsLoadSavePathReinit())
+		return;
+	if ((uint8_t*)owner->moveType != owner->amtMemBuffer)
+		return;
+	if (owner->moveDef == nullptr)
+		return;
+	if (useRawMovement)
+		return;
+	if ((owner->pos - goalPos).SqLength2D() <= Square(goalRadius + extraRadius)) {
+		pathID = 0;
+		atGoal = true;
+		return;
+	}
+
+	const float3 savedGoalPos = goalPos;
+	const float savedGoalRadius = goalRadius;
+
+	StopMoving(false, false, false);
+	StartMoving(savedGoalPos, savedGoalRadius);
 }
 
 bool CGroundMoveType::OwnerMoved(const short oldHeading, const float3& posDif, const float3& cmpEps) {
@@ -3101,14 +3170,21 @@ void CGroundMoveType::LeaveTransport()
 void CGroundMoveType::Connect() {
 	RECOIL_DETAILED_TRACY_ZONE;
 	Sim::registry.emplace_or_replace<GroundMoveType>(owner->entityReference, owner->id);
-	Sim::registry.emplace_or_replace<FeatureCollisionEvents>(owner->entityReference);
-	Sim::registry.emplace_or_replace<UnitCollisionEvents>(owner->entityReference);
-	Sim::registry.emplace_or_replace<FeatureCrushEvents>(owner->entityReference);
-	Sim::registry.emplace_or_replace<UnitCrushEvents>(owner->entityReference);
-	Sim::registry.emplace_or_replace<FeatureMoveEvents>(owner->entityReference);
-	Sim::registry.emplace_or_replace<UnitMovedEvent>(owner->entityReference);
-	Sim::registry.emplace_or_replace<ChangeHeadingEvent>(owner->entityReference, owner->id);
-	Sim::registry.emplace_or_replace<ChangeMainHeadingEvent>(owner->entityReference, owner->id);
+	(void) Sim::registry.get_or_emplace<FeatureCollisionEvents>(owner->entityReference);
+	(void) Sim::registry.get_or_emplace<UnitCollisionEvents>(owner->entityReference);
+	(void) Sim::registry.get_or_emplace<FeatureCrushEvents>(owner->entityReference);
+	(void) Sim::registry.get_or_emplace<UnitCrushEvents>(owner->entityReference);
+	(void) Sim::registry.get_or_emplace<FeatureMoveEvents>(owner->entityReference);
+
+	auto& movedEvent = Sim::registry.get_or_emplace<UnitMovedEvent>(owner->entityReference);
+	movedEvent.unit = owner;
+	movedEvent.unitId = owner->id;
+
+	auto& headingEvent = Sim::registry.get_or_emplace<ChangeHeadingEvent>(owner->entityReference, owner->id);
+	headingEvent.unitId = owner->id;
+
+	auto& mainHeadingEvent = Sim::registry.get_or_emplace<ChangeMainHeadingEvent>(owner->entityReference, owner->id);
+	mainHeadingEvent.unitId = owner->id;
 	// LOG("%s: loading %s as %d", __func__, owner->unitDef->name.c_str(), entt::to_integral(owner->entityReference));
 }
 
@@ -3728,4 +3804,3 @@ bool CGroundMoveType::SetMemberValue(unsigned int memberHash, void* memberValue)
 
 	return false;
 }
-

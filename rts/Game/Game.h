@@ -99,6 +99,10 @@ public:
 	void ParseInputTextGeometry(const std::string& geo);
 
 	void Save(std::string&& fileName, std::string&& saveArgs);
+	void SaveReplayCheckpoint(std::string&& fileName, std::string&& saveArgs, int checkpointFrame, float checkpointTime);
+	bool QueueReplayResumeFromCheckpoint(const std::string& saveFileName, int targetFrame, float targetTime);
+	bool QueueReplayResumeFromStart(int targetFrame, float targetTime);
+	void FinalizeLoadSavePostLoad();
 
 	void ResizeEvent() override;
 
@@ -145,8 +149,15 @@ private:
 	void ClientReadNet();
 	void UpdateNumQueuedSimFrames();
 	void UpdateNetMessageProcessingTimeLeft();
+	void MaybeCreateAutoReplayCheckpoint(bool newSimFrame);
+	void FlushPendingReplayCheckpointSave();
+	void ActivatePendingReplayResumeRequest();
 	void SimFrame();
 	void StartPlaying();
+	std::string BuildReplayCheckpointLoadScript(const std::string& saveRelativePath) const;
+	std::string BuildReplayStartScript() const;
+	std::string GetLocalReplayPlayerName() const;
+	bool QueueReplayReloadScript(std::string&& reloadScript, int targetFrame, float targetTime, bool expectCheckpoint);
 
 public:
 	GameDrawMode gameDrawMode = gameNotDrawing;
@@ -224,6 +235,17 @@ private:
 	ILoadSaveHandler* saveFileHandler;
 
 	CGameInputReceiver gameInputReceiver;
+	int lastReplayAutoCheckpointBucket = -1;
+	std::string pendingReplayCheckpointFileName;
+	std::string pendingReplayCheckpointArgs;
+	bool pendingReplayCheckpointSave = false;
+	bool pendingReplayCheckpointIsAuto = false;
+	int pendingReplayCheckpointRequestedFrame = -1;
+	float pendingReplayCheckpointRequestedTime = -1.0f;
+	int pendingReplayCheckpointLastWaitLogFrame = -1;
+	int pendingReplayResumeTargetFrame = -1;
+	float pendingReplayResumeTargetTime = -1.0f;
+	bool pendingReplayResumeSkip = false;
 
 	std::atomic<bool> loadDone = {false};
 	std::atomic<bool> gameOver = {false};
@@ -233,4 +255,3 @@ private:
 extern CGame* game;
 
 #endif // _GAME_H
-

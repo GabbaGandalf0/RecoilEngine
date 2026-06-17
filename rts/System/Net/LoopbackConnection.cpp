@@ -25,6 +25,11 @@ void CLoopbackConnection::DeleteBufferPacketAt(unsigned index) {
 	pktQueue.erase(pktQueue.begin() + index);
 }
 
+void CLoopbackConnection::ClearQueue() {
+	pktQueue.clear();
+	numPings = 0;
+}
+
 std::shared_ptr<const RawPacket> CLoopbackConnection::GetData() {
 	if (pktQueue.empty())
 		return {};
@@ -37,4 +42,3 @@ std::shared_ptr<const RawPacket> CLoopbackConnection::GetData() {
 }
 
 } // namespace netcode
-

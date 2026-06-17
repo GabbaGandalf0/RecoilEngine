@@ -11,6 +11,7 @@
 #include <cinttypes>
 
 #include "System/Rectangle.h"
+#include "System/creg/creg_cond.h"
 #include "Node.h"
 #include "PathDefines.h"
 #include "PathThreads.h"
@@ -24,6 +25,29 @@ struct MoveDef;
 
 namespace QTPFS {
 	struct INode;
+
+	struct LoadSaveNodeLayerState {
+		CR_DECLARE_STRUCT(LoadSaveNodeLayerState)
+
+		unsigned int layerNumber = 0;
+		unsigned int numLeafNodes = 0;
+		unsigned int updateCounter = 0;
+		unsigned int numOpenNodes = 0;
+		unsigned int numClosedNodes = 0;
+		int32_t maxNodesAlloced = 0;
+		int32_t numRootNodes = 0;
+		int32_t xRootNodes = 0;
+		int32_t zRootNodes = 0;
+		int32_t rootNodeSize = 0;
+		uint32_t rootMask = 0;
+		unsigned int xsize = 0;
+		unsigned int zsize = 0;
+		float maxRelSpeedMod = 0.0f;
+		float avgRelSpeedMod = 0.0f;
+		bool useShortestPath = false;
+		std::vector<unsigned int> recycledNodeIndices;
+		std::vector<LoadSaveQTNodeState> poolNodeStates;
+	};
 
 	struct NodeLayer {
 	public:
@@ -41,6 +65,8 @@ namespace QTPFS {
 
 		void Init(unsigned int layerNum);
 		void Clear();
+		void CaptureLoadSaveState(LoadSaveNodeLayerState& outState) const;
+		void RestoreLoadSaveState(const LoadSaveNodeLayerState& inState);
 
 		bool Update(UpdateThreadData& threadData);
 
@@ -233,4 +259,3 @@ private:
 }
 
 #endif
-

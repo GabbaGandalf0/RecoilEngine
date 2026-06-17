@@ -113,17 +113,32 @@ public:
 	float GetWantedSpeed() const { return wantedSpeed; }
 	float GetCurrentSpeed() const { return currentSpeed; }
 	float GetDeltaSpeed() const { return deltaSpeed; }
+	float GetOldSpeed() const { return oldSpeed; }
+	float GetNewSpeed() const { return newSpeed; }
 
 	float GetCurrWayPointDist() const { return currWayPointDist; }
 	float GetPrevWayPointDist() const { return prevWayPointDist; }
 	float GetGoalRadius(float s = 0.0f) const override { return (goalRadius + extraRadius * s); }
 
 	unsigned int GetPathID() const { return pathID; }
+	bool NeedsLoadSavePathReinit() const;
+	void RebuildPathAfterLoadSaveRestore(bool force = false);
 
 	const SyncedFloat3& GetCurrWayPoint() const { return currWayPoint; }
 	const SyncedFloat3& GetNextWayPoint() const { return nextWayPoint; }
 
 	const float3& GetFlatFrontDir() const { return flatFrontDir; }
+	const float3& GetWaypointDir() const { return waypointDir; }
+	const float3& GetLastAvoidanceDir() const { return lastAvoidanceDir; }
+	const float3& GetResultantForces() const { return resultantForces; }
+	const float3& GetMovingCollisionForces() const { return forceFromMovingCollidees; }
+	const float3& GetStaticCollisionForces() const { return forceFromStaticCollidees; }
+	int GetSetHeadingState() const { return setHeading; }
+	short GetSetHeadingDir() const { return setHeadingDir; }
+	short GetWantedHeading() const { return wantedHeading; }
+	short GetLimitSpeedForTurning() const { return limitSpeedForTurning; }
+	bool IsPositionStuck() const { return positionStuck; }
+	bool IsAvoidingUnits() const { return avoidingUnits; }
 	const float3& GetGroundNormal(const float3&) const;
 	float GetGroundHeight(const float3&) const;
 
@@ -309,4 +324,3 @@ private:
 };
 
 #endif // GROUNDMOVETYPE_H
-
