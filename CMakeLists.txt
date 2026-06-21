@@ -577,6 +577,7 @@ endif(EXISTS "${CMAKE_SOURCE_DIR}/.git")
 
 # Generate the version files
 set(VERSION_GENERATE_DIR "${CMAKE_BINARY_DIR}")
+set(REWIND_REPLAY_VERSION_OVERRIDE "" CACHE STRING "Exact replay-compatible engine version for BAR Rewind distribution builds")
 
 set(VERSION_GENERATE_SOURCES
 		"${VERSION_GENERATE_DIR}/src-generated/engine/System/VersionGenerated.h"
@@ -598,6 +599,7 @@ add_custom_command(TARGET generateVersionFiles
 		"-DCMAKE_MODULES_SPRING=${CMAKE_MODULES_SPRING}"
 		"-DGENERATE_DIR=${VERSION_GENERATE_DIR}"
 		"-DVERSION_ADDITIONAL=${VERSION_ADDITIONAL}"
+		"-DREWIND_REPLAY_VERSION_OVERRIDE=${REWIND_REPLAY_VERSION_OVERRIDE}"
 		-P "${CMAKE_MODULES_SPRING}/ConfigureVersion.cmake"
 		"${VERSION_GENERATE_DIR}"
 	COMMENT

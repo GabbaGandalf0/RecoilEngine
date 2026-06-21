@@ -24,8 +24,14 @@ include(UtilVersion)
 
 
 
-# Fetch through git or from the VERSION file
-fetch_spring_version(${SOURCE_ROOT} SPRING_ENGINE)
+# Distribution builds must report the original replay sync version even when
+# the rewind patch itself is committed after that release tag.
+if (NOT "${REWIND_REPLAY_VERSION_OVERRIDE}" STREQUAL "")
+	set(SPRING_ENGINE_VERSION "${REWIND_REPLAY_VERSION_OVERRIDE}")
+else()
+	# Fetch through git or from the VERSION file
+	fetch_spring_version(${SOURCE_ROOT} SPRING_ENGINE)
+endif()
 parse_spring_version(SPRING_VERSION_ENGINE "${SPRING_ENGINE_VERSION}")
 
 # We define these, so it may be used in the to-be-configured files

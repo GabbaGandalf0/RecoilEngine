@@ -665,7 +665,23 @@ void CGame::ClientReadNet()
 					int32_t   frameNum; pckt >> frameNum;
 					uint32_t  checkSum; pckt >> checkSum;
 
-					const uint32_t ourCheckSum = localSyncChecksums[frameNum];
+					const auto localChecksumIt = localSyncChecksums.find(frameNum);
+					if (
+						localChecksumIt == localSyncChecksums.end() &&
+						IsReplayCheckpointSession() &&
+						frameNum < gs->frameNum
+					) {
+						// Server read-ahead captured this already-processed demo
+						// response in the checkpoint queue. The fresh process has no
+						// checksum history for frames preceding the restored frame.
+						break;
+					}
+
+					const uint32_t ourCheckSum = (
+						localChecksumIt != localSyncChecksums.end()
+							? localChecksumIt->second
+							: 0
+					);
 
 					// check if our checksum for this frame matches what
 					// player <playerNum> sent to the server at the same
